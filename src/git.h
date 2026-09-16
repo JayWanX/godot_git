@@ -119,9 +119,12 @@ private:
 	bool job_active = false;            // 后台网络任务执行中
 	bool job_posted = false;            // 有待执行的网络任务
 	BgJob posted_job;
-	git_repository_ptr bg_repo;         // 仅后台线程访问的独立句柄
 	std::vector<StatusEntry> status_snapshot; // 最近一次状态快照
 	HashMap<String, TypedArray<Dictionary>> diff_cache; // diff 预计算缓存，键 "路径#区域"
+	uint64_t write_generation = 0;      // 主线程写操作计数（bg_mutex 保护）：后台扫描期间
+	                                    // 发生写操作则扫描结果作废，防止旧快照覆盖新状态
+	std::vector<String> pending_commit_ids;     // 待预计算 diff 的提交 SHA 队列（bg_mutex 保护）
+	bool commit_precompute_pending = false;     // 上列队列有未处理内容（bg_mutex 保护）
 	bool fs_signal_connected = false;   // 仅主线程访问：是否已连接 EditorFileSystem 信号
 
 	void _start_bg_thread();
@@ -134,6 +137,7 @@ private:
 	TypedArray<Dictionary> _status_to_array(const std::vector<StatusEntry> &p_entries);
 	void _sync_refresh_status();
 	void _precompute_diffs(git_repository *p_repo, const std::vector<StatusEntry> &p_entries, HashMap<String, TypedArray<Dictionary>> &r_cache);
+	void _precompute_commit_diffs(git_repository *p_repo, const std::vector<String> &p_ids);
 	TypedArray<Dictionary> _compute_diff_with(git_repository *p_repo, const String &identifier, int32_t area);
 	String _current_branch_name_with(git_repository *p_repo);
 	void _post_job(int p_type, const String &p_remote, bool p_force);

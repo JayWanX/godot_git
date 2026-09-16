@@ -15,13 +15,6 @@
 #include "core/string/ustring.h"
 #include "core/variant/variant.h"
 
-// —— 临时跟踪（卡死定位用，定位后整体移除）：冻结发生时控制台最后一行
-// 即为主线程最后进入的调用 ——
-static void _git_trace(const String &p_msg) {
-	// 带线程 ID：主线程与后台线程的输出可区分，避免误判卡死在哪条线程。
-	print_line("[git-trace][T" + itos((int64_t)Thread::get_caller_id()) + "] " + p_msg);
-}
-
 // MODULE_GDSCRIPT_ENABLED 不在任何全局头文件链里，必须显式 include 这个
 // 构建期生成的头（与引擎 editor_node.cpp 等文件的做法一致），
 // 下面的 #ifdef 才能正确看到 gdscript 模块的启用状态。
@@ -244,7 +237,6 @@ void Git::_set_credentials(const String &username, const String &password, const
 }
 
 void Git::_discard_file(const String &file_path) {
-	_git_trace("discard_file enter " + file_path);
 	_wait_no_job(); // 网络任务会写索引/工作区，与写操作互斥
 	git_checkout_options opts = GIT_CHECKOUT_OPTIONS_INIT;
 	CString c_path(file_path);
@@ -257,7 +249,6 @@ void Git::_discard_file(const String &file_path) {
 }
 
 void Git::_commit(const String &msg, bool amend) {
-	_git_trace("commit enter");
 	_wait_no_job(); // 网络任务会写索引/工作区，与写操作互斥
 
 	// pull 已移到后台线程，合并状态跨线程传递：持锁取本地副本。
@@ -350,7 +341,6 @@ bool Git::_allow_amends() {
 }
 
 void Git::_stage_file(const String &file_path) {
-	_git_trace("stage_file enter " + file_path);
 	_wait_no_job(); // 网络任务会写索引/工作区，与写操作互斥
 	CString c_path(file_path);
 	char *paths[] = { c_path.data };
@@ -364,7 +354,6 @@ void Git::_stage_file(const String &file_path) {
 }
 
 void Git::_unstage_file(const String &file_path) {
-	_git_trace("unstage_file enter " + file_path);
 	_wait_no_job(); // 网络任务会写索引/工作区，与写操作互斥
 	CString c_path(file_path);
 	char *paths[] = { c_path.data };
@@ -428,7 +417,6 @@ TypedArray<Dictionary> Git::_get_modified_files_data() {
 	// 直接返回后台线程维护的快照，主线程零耗时（status 全量扫描是原本最频繁
 	// 的阻塞源）。快照的新鲜度由三处保证：_initialize 时同步首扫、后台线程
 	// 周期刷新（外部变化，如命令行里的 git 操作）、写操作后 _sync_refresh_status。
-	_git_trace("get_modified_files_data enter");
 	std::vector<StatusEntry> local;
 	{
 		std::unique_lock<std::mutex> lock(bg_mutex);
@@ -436,9 +424,7 @@ TypedArray<Dictionary> Git::_get_modified_files_data() {
 	}
 	// 持锁窗口内不做任何打印/重活（print_line 会拿引擎全局锁，可能与后台
 	// 线程形成锁序交叉），拷贝完立即解锁，转换在锁外进行。
-	_git_trace("get_modified_files_data lock released");
 	TypedArray<Dictionary> result = _status_to_array(local);
-	_git_trace("get_modified_files_data exit");
 	return result;
 }
 
@@ -525,8 +511,8 @@ TypedArray<Dictionary> Git::_status_to_array(const std::vector<StatusEntry> &p_e
 
 void Git::_sync_refresh_status() {
 	// 主线程写操作（stage/commit/checkout 等）落盘后调用：立即重扫一次快照，
-	// 保证面板下一次取数即为新状态；diff 缓存一并失效，由后台线程重建。
-	_git_trace("sync_refresh_status enter");
+	// 保证面板下一次取数即为新状态。工作区 diff 缓存一并失效，由后台线程重建；
+	// 提交 diff（SHA 键，内容对当前分支无依赖）保留，避免整批重算。
 	if (!repo) {
 		return;
 	}
@@ -534,12 +520,19 @@ void Git::_sync_refresh_status() {
 	_scan_status_into(repo.get(), fresh);
 	std::unique_lock<std::mutex> lock(bg_mutex);
 	status_snapshot = std::move(fresh);
-	diff_cache.clear();
-	_git_trace("sync_refresh_status exit");
+	Vector<String> to_erase;
+	for (const KeyValue<String, TypedArray<Dictionary>> &kv : diff_cache) {
+		if (kv.key.rfind("#") != 40) { // 非 "<40位SHA>#0" 形态即工作区条目
+			to_erase.push_back(kv.key);
+		}
+	}
+	for (const String &k : to_erase) {
+		diff_cache.erase(k);
+	}
+	write_generation++; // 作废扫描中的后台结果，防止旧快照覆盖新状态
 }
 
 TypedArray<String> Git::_get_branch_list() {
-	_git_trace("get_branch_list enter");
 	git_branch_iterator_ptr it;
 	GIT2_CALL_R(git_branch_iterator_new(Capture(it), repo.get(), GIT_BRANCH_LOCAL), "Could not create branch iterator", TypedArray<Dictionary>());
 
@@ -593,7 +586,6 @@ void Git::_remove_remote(const String &remote_name) {
 }
 
 TypedArray<Dictionary> Git::_get_line_diff(const String &file_path, const String &text) {
-	_git_trace("get_line_diff enter " + file_path);
 	git_diff_options opts = GIT_DIFF_OPTIONS_INIT;
 
 	opts.context_lines = 0;
@@ -623,7 +615,6 @@ TypedArray<Dictionary> Git::_get_line_diff(const String &file_path, const String
 }
 
 String Git::_get_current_branch_name() {
-	_git_trace("get_current_branch_name enter");
 	return _current_branch_name_with(repo.get());
 }
 
@@ -646,7 +637,6 @@ String Git::_current_branch_name_with(git_repository *p_repo) {
 }
 
 TypedArray<String> Git::_get_remotes() {
-	_git_trace("get_remotes enter");
 	git_strarray remote_array;
 	GIT2_CALL_R(git_remote_list(&remote_array, repo.get()), "Could not get list of remotes", TypedArray<Dictionary>());
 
@@ -660,7 +650,6 @@ TypedArray<String> Git::_get_remotes() {
 }
 
 TypedArray<Dictionary> Git::_get_previous_commits(int32_t max_commits) {
-	_git_trace("get_previous_commits enter, max=" + itos(max_commits));
 	git_revwalk_ptr walker;
 	GIT2_CALL_R(git_revwalk_new(Capture(walker), repo.get()), "Could not create new revwalk", TypedArray<Dictionary>());
 	GIT2_CALL_R(git_revwalk_sorting(walker.get(), GIT_SORT_TIME), "Could not sort revwalk by time", TypedArray<Dictionary>());
@@ -669,6 +658,7 @@ TypedArray<Dictionary> Git::_get_previous_commits(int32_t max_commits) {
 
 	git_oid oid;
 	TypedArray<Dictionary> commits;
+	std::vector<String> commit_ids; // 交给后台线程预计算 diff 的批次
 	char commit_id[GIT_OID_HEXSZ + 1];
 	for (int i = 0; !git_revwalk_next(&oid, walker.get()) && i <= max_commits; i++) {
 		git_commit_ptr commit;
@@ -681,7 +671,17 @@ TypedArray<Dictionary> Git::_get_previous_commits(int32_t max_commits) {
 		String author = String::utf8(sig->name) + " <" + String::utf8(sig->email) + ">";
 
 		commits.push_back(create_commit(msg, author, commit_id, sig->when.time, sig->when.offset));
+		commit_ids.push_back(String(commit_id));
 	}
+
+	// 把这批提交转交后台线程预计算 diff：提交列表点击时 _get_diff 直接命中缓存。
+	// 历史提交 diff 此前是主线程同步算（大提交动辄上千 delta，能把编辑器卡数秒）。
+	{
+		std::unique_lock<std::mutex> lock(bg_mutex);
+		pending_commit_ids = std::move(commit_ids);
+		commit_precompute_pending = true;
+	}
+	bg_cv.notify_all();
 
 	return commits;
 }
@@ -724,10 +724,8 @@ void Git::_post_job(int p_type, const String &p_remote, bool p_force) {
 void Git::_wait_no_job() {
 	// 主线程写操作与后台网络任务互斥：无任务时立即通过，有任务时等待其结束
 	// （网络任务期间用户点 stage/commit 等，宁可稍等也不允许并发写索引/工作区）。
-	_git_trace("wait_no_job enter (job_active=" + String(job_active ? "true" : "false") + ")");
 	std::unique_lock<std::mutex> lock(bg_mutex);
 	bg_cv.wait(lock, [this]() { return !job_active; });
-	_git_trace("wait_no_job exit");
 }
 
 void Git::_run_network_job(const BgJob &p_job, git_repository *p_repo) {
@@ -907,7 +905,6 @@ void Git::_push_impl(git_repository *p_repo, Credentials &p_creds, const String 
 }
 
 bool Git::_checkout_branch(const String &branch_name) {
-	_git_trace("checkout_branch enter " + branch_name);
 	_wait_no_job(); // 网络任务会写索引/工作区，与写操作互斥
 	git_reference_ptr branch;
 	GIT2_CALL_R(git_branch_lookup(Capture(branch), repo.get(), CString(branch_name).data, GIT_BRANCH_LOCAL), "Could not find branch", false);
@@ -930,16 +927,19 @@ TypedArray<Dictionary> Git::_get_diff(const String &identifier, const int32_t ar
 	// 命中缓存即零耗时返回；未命中（刚改动后台尚未重算、或历史提交查看）回退
 	// 为主线程同步计算，保证点击文件总能看到 diff。
 	String key = identifier + "#" + String::num_int64(area);
-	_git_trace("get_diff enter " + key);
+	bool cache_hit = false;
+	TypedArray<Dictionary> cached;
 	{
 		std::unique_lock<std::mutex> lock(bg_mutex);
 		HashMap<String, TypedArray<Dictionary>>::Iterator it = diff_cache.find(key);
 		if (it) {
-			_git_trace("get_diff cache hit " + key);
-			return it->value;
+			cache_hit = true;
+			cached = it->value; // 锁内只做查找与拷贝
 		}
 	}
-	_git_trace("get_diff cache miss, sync compute " + key);
+	if (cache_hit) {
+		return cached;
+	}
 
 	if (!repo) {
 		return TypedArray<Dictionary>();
@@ -1073,7 +1073,6 @@ String Git::_get_vcs_name() {
 }
 
 bool Git::_initialize(const String &project_path) {
-	_git_trace("initialize enter");
 	ERR_FAIL_COND_V(project_path == "", false);
 
 	// 重连 VCS 时会重复调用 _initialize，先停掉旧的后台线程再重建。
@@ -1141,7 +1140,6 @@ bool Git::_initialize(const String &project_path) {
 }
 
 bool Git::_shut_down() {
-	_git_trace("shut_down enter");
 	if (fs_signal_connected && EditorFileSystem::get_singleton() != nullptr) {
 		EditorFileSystem::get_singleton()->disconnect(SNAME("filesystem_changed"), callable_mp(this, &Git::_on_filesystem_changed));
 		fs_signal_connected = false;
@@ -1207,18 +1205,20 @@ void Git::_bg_main() {
 	}
 
 	std::unique_lock<std::mutex> lock(bg_mutex);
-	int dbg_cycle = 0; // 临时跟踪用
 	while (!bg_stop) {
 		// 事件驱动为主：编辑器 filesystem_changed 信号或投递的任务会立即唤醒；
 		// 5 秒兜底轮询只覆盖编辑器感知不到的场景（如终端里的 git 操作恰好
 		// 在编辑器聚焦期间发生）。wait_for 调用时必须已持有锁。
 		bg_cv.wait_for(lock, std::chrono::milliseconds(5000), [this]() {
-			return bg_stop.load() || job_posted || scan_requested.load();
+			return bg_stop.load() || job_posted || scan_requested.load() || commit_precompute_pending;
 		});
 		if (bg_stop) {
 			break;
 		}
 		scan_requested = false; // 消费扫描请求（无论由信号还是超时兜底触发都要扫）
+		// 记下本轮扫描起点的写版本号：扫描期间若主线程发生写操作（版本号增长），
+		// 写路径已自行刷新过快照，本轮结果就是过期的，发布时必须丢弃。
+		const uint64_t gen_at_start = write_generation;
 		// 锁内只做状态摘取，随后立刻解锁——下面的打印与 libgit2 调用绝不能
 		// 发生在持锁窗口内：print_line/ERR_PRINT 内部要拿引擎全局锁、控制台、
 		// 编辑器日志处理器等资源，与主线程交叉即成 ABBA 死锁（实测卡死形态）。
@@ -1232,26 +1232,19 @@ void Git::_bg_main() {
 			job_active = true;
 			has_job = true;
 		}
-		const int cycle_no = dbg_cycle++;
 		lock.unlock();
 
-		_git_trace("bg cycle " + itos(cycle_no) + " begin");
-
 		if (has_job) {
-			_git_trace("bg network job start");
 			_run_network_job(job, thread_repo.get()); // 网络操作，可能耗时数分钟
 			{
 				std::lock_guard<std::mutex> l(bg_mutex);
 				job_active = false;
 			}
 			bg_cv.notify_all(); // 唤醒可能正阻塞在 _wait_no_job 的主线程写操作
-			_git_trace("bg network job done");
 		}
 
-		_git_trace("bg scan begin");
 		std::vector<StatusEntry> fresh;
 		_scan_status_into(thread_repo.get(), fresh);
-		_git_trace("bg scan done, entries=" + itos((int)fresh.size()));
 
 		// 与上次快照完全一致时跳过 diff 预计算并复用现有缓存：编辑器每次
 		// 保存/导入都发 filesystem_changed，但绝大多数并不改变 git 状态，
@@ -1261,18 +1254,71 @@ void Git::_bg_main() {
 		if (!unchanged) {
 			_precompute_diffs(thread_repo.get(), fresh, new_cache);
 		}
-		_git_trace(unchanged ? "bg precompute skipped (unchanged)" : "bg precompute done, publishing");
 
 		// 重新上锁发布快照（锁内零 IO，仅两次 move）。发布后【保持持锁】回到
 		// 循环顶的 wait_for——wait_for 要求调用方已持有锁，未持锁调用是 UB，
 		// MSVC 下实测直接挂死（后台线程消失 + 主线程永远抢不到 bg_mutex）。
 		lock.lock();
-		status_snapshot = std::move(fresh);
-		if (!unchanged) {
-			diff_cache = std::move(new_cache);
+		const bool stale_generation = (write_generation != gen_at_start);
+		if (!stale_generation) {
+			status_snapshot = std::move(fresh);
+			if (!unchanged) {
+				diff_cache = std::move(new_cache);
+			}
+		} // 写路径已刷新过时丢弃本轮结果（stale_generation 为真）
+
+		// 提交 diff 预计算队列（仅锁内搬移，计算在解锁后进行）。
+		std::vector<String> commit_todo;
+		if (commit_precompute_pending) {
+			commit_todo = std::move(pending_commit_ids);
+			pending_commit_ids.clear();
+			commit_precompute_pending = false;
 		}
+		lock.unlock();
+
+		if (!commit_todo.empty()) {
+			_precompute_commit_diffs(thread_repo.get(), commit_todo);
+		}
+		lock.lock(); // 恢复循环不变量：回到 wait_for 时必须持锁（无条件，含无队列路径）
 	}
 	thread_repo.reset();
+}
+
+void Git::_precompute_commit_diffs(git_repository *p_repo, const std::vector<String> &p_ids) {
+	// 为提交列表当前展示的这批提交预计算 diff（后台线程调用，计算全程不持锁）。
+	// 缓存键与 _get_diff 一致："<40位SHA>#<TREE_AREA_COMMIT>"。旧的提交条目
+	// （不在本批次内）在合并时驱逐，内存上限即为一次提交列表的规模。
+	const String commit_key_suffix = "#" + String::num_int64(TREE_AREA_COMMIT);
+	HashMap<String, TypedArray<Dictionary>> fresh_map;
+	for (const String &id : p_ids) {
+		String key = id + commit_key_suffix;
+		bool already_cached = false;
+		{
+			std::unique_lock<std::mutex> lock(bg_mutex);
+			already_cached = diff_cache.has(key); // 面板重复刷新时整批命中，零重算
+		}
+		if (!already_cached) {
+			fresh_map.insert(key, _compute_diff_with(p_repo, id, TREE_AREA_COMMIT));
+		}
+	}
+
+	// 合并 + 驱逐不在本批次的旧提交条目（工作区键的 "#1"/"#2" 不受影响；
+	// 提交键的特征是分隔符恰好位于第 40 位——SHA 固定 40 位十六进制）。
+	{
+		std::unique_lock<std::mutex> lock(bg_mutex);
+		Vector<String> to_erase;
+		for (const KeyValue<String, TypedArray<Dictionary>> &kv : diff_cache) {
+			if (kv.key.rfind("#") == 40 && !fresh_map.has(kv.key)) {
+				to_erase.push_back(kv.key);
+			}
+		}
+		for (const String &k : to_erase) {
+			diff_cache.erase(k);
+		}
+		for (const KeyValue<String, TypedArray<Dictionary>> &kv : fresh_map) {
+			diff_cache.insert(kv.key, kv.value);
+		}
+	}
 }
 
 bool Git::_status_equal(const std::vector<StatusEntry> &p_a, const std::vector<StatusEntry> &p_b) {

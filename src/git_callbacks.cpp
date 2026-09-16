@@ -2,7 +2,7 @@
 #include <cstring>
 
 #include "git_callbacks.h"
-#include "git_plugin.h"
+#include "git.h"
 
 #include "core/variant/variant_utility.h"
 
@@ -101,7 +101,7 @@ extern "C" int credentials_cb(git_cred **out, const char *url, const char *usern
 extern "C" int diff_hunk_cb(const git_diff_delta *delta, const git_diff_hunk *range, void *payload) {
 	DiffHelper *diff_helper = (DiffHelper *)payload;
 
-	Dictionary hunk = diff_helper->git_plugin->create_diff_hunk(range->old_start, range->new_start, range->old_lines, range->new_lines);
+	Dictionary hunk = diff_helper->git->create_diff_hunk(range->old_start, range->new_start, range->old_lines, range->new_lines);
 	diff_helper->diff_hunks->push_back(hunk);
 
 	return 1;

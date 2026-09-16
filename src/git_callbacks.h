@@ -3,11 +3,11 @@
 #include "core/variant/array.h"
 #include "git2.h"
 
-class GitPlugin;
+class Git;
 
 struct DiffHelper {
 	Array *diff_hunks;
-	GitPlugin *git_plugin;
+	Git *git;
 };
 
 extern "C" int progress_cb(const char *str, int len, void *data);

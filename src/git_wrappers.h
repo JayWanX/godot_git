@@ -5,7 +5,7 @@
 #include "core/string/ustring.h"
 #include "git2.h"
 
-class GitPlugin;
+class Git;
 
 struct CString {
 	char *data = nullptr;

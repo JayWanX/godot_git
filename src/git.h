@@ -18,8 +18,8 @@ struct Credentials {
 	String ssh_passphrase;
 };
 
-class GitPlugin : public EditorVCSInterface {
-	GDCLASS(GitPlugin, EditorVCSInterface);
+class Git : public EditorVCSInterface {
+	GDCLASS(Git, EditorVCSInterface);
 
 protected:
 	static void _bind_methods();
@@ -32,9 +32,9 @@ public:
 	String repo_project_path;
 	std::unordered_map<git_status_t, ChangeType> map_changes;
 
-	GitPlugin();
+	Git();
 
-	// Endpoints（由桥接 GDScript 转发，见 git_plugin.cpp 的 GIT_BRIDGE_SCRIPT）
+	// Endpoints（由桥接 GDScript 转发，见 git.cpp 的 GIT_BRIDGE_SCRIPT）
 	bool _initialize(const String &project_path);
 	void _set_credentials(const String &username, const String &password, const String &ssh_public_key_path, const String &ssh_private_key_path, const String &ssh_passphrase);
 	TypedArray<Dictionary> _get_modified_files_data();

@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-# godot_git 模块构建入口：把插件源码编进引擎，并链接预先用 cmake 编好的第三方静态库。
+# godot_git 模块构建入口：把模块源码编进引擎，并链接预先用 cmake 编好的第三方静态库。
 #
 # 第三方库产物来源（一次性，由仓库根的 SConstruct / cmake 生成）：
 #   bin/thirdparty/git2/windows/x86_64/git2.lib              （libgit2，USE_HTTPS=OpenSSL + GIT_SSH=libssh2）

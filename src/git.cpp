@@ -1,4 +1,4 @@
-#include "git_plugin.h"
+#include "git.h"
 
 #include <cstring>
 
@@ -11,6 +11,11 @@
 #include "core/string/print_string.h"
 #include "core/string/ustring.h"
 #include "core/variant/variant.h"
+
+// MODULE_GDSCRIPT_ENABLED 不在任何全局头文件链里，必须显式 include 这个
+// 构建期生成的头（与引擎 editor_node.cpp 等文件的做法一致），
+// 下面的 #ifdef 才能正确看到 gdscript 模块的启用状态。
+#include "modules/modules_enabled.gen.h"
 
 #ifdef MODULE_GDSCRIPT_ENABLED
 #include "modules/gdscript/gdscript.h"
@@ -119,7 +124,7 @@ func _get_line_diff(file_path: String, text: String) -> Array:
 	return git_get_line_diff(file_path, text)
 )BRIDGE";
 
-void GitPlugin::_attach_bridge_script() {
+void Git::_attach_bridge_script() {
 #ifdef MODULE_GDSCRIPT_ENABLED
 	// 每个实例持有自己的桥脚本（不用 static：引擎退出时静态 Resource 的析构
 	// 会晚于 GDScriptLanguage::finish，存在崩溃风险；随对象释放则生命周期干净）。
@@ -129,40 +134,40 @@ void GitPlugin::_attach_bridge_script() {
 	bridge->reload();
 	set_script(bridge);
 #else
-	ERR_PRINT_ONCE("GitPlugin: GDScript module is required for the VCS bridge.");
+	ERR_PRINT_ONCE("Git: GDScript module is required for the VCS bridge.");
 #endif
 }
 
-void GitPlugin::_bind_methods() {
+void Git::_bind_methods() {
 	// 暴露给桥接 GDScript 的 C++ 实现（见 GIT_BRIDGE_SCRIPT）
-	ClassDB::bind_method(D_METHOD("git_initialize", "project_path"), &GitPlugin::_initialize);
-	ClassDB::bind_method(D_METHOD("git_set_credentials", "username", "password", "ssh_public_key_path", "ssh_private_key_path", "ssh_passphrase"), &GitPlugin::_set_credentials);
-	ClassDB::bind_method(D_METHOD("git_get_modified_files_data"), &GitPlugin::_get_modified_files_data);
-	ClassDB::bind_method(D_METHOD("git_stage_file", "file_path"), &GitPlugin::_stage_file);
-	ClassDB::bind_method(D_METHOD("git_unstage_file", "file_path"), &GitPlugin::_unstage_file);
-	ClassDB::bind_method(D_METHOD("git_discard_file", "file_path"), &GitPlugin::_discard_file);
-	ClassDB::bind_method(D_METHOD("git_commit", "msg", "amend"), &GitPlugin::_commit);
-	ClassDB::bind_method(D_METHOD("git_allow_amends"), &GitPlugin::_allow_amends);
-	ClassDB::bind_method(D_METHOD("git_get_diff", "identifier", "area"), &GitPlugin::_get_diff);
-	ClassDB::bind_method(D_METHOD("git_shut_down"), &GitPlugin::_shut_down);
-	ClassDB::bind_method(D_METHOD("git_get_vcs_name"), &GitPlugin::_get_vcs_name);
-	ClassDB::bind_method(D_METHOD("git_get_previous_commits", "max_commits"), &GitPlugin::_get_previous_commits);
-	ClassDB::bind_method(D_METHOD("git_get_branch_list"), &GitPlugin::_get_branch_list);
-	ClassDB::bind_method(D_METHOD("git_get_remotes"), &GitPlugin::_get_remotes);
-	ClassDB::bind_method(D_METHOD("git_create_branch", "branch_name"), &GitPlugin::_create_branch);
-	ClassDB::bind_method(D_METHOD("git_remove_branch", "branch_name"), &GitPlugin::_remove_branch);
-	ClassDB::bind_method(D_METHOD("git_create_remote", "remote_name", "remote_url"), &GitPlugin::_create_remote);
-	ClassDB::bind_method(D_METHOD("git_remove_remote", "remote_name"), &GitPlugin::_remove_remote);
-	ClassDB::bind_method(D_METHOD("git_get_current_branch_name"), &GitPlugin::_get_current_branch_name);
-	ClassDB::bind_method(D_METHOD("git_checkout_branch", "branch_name"), &GitPlugin::_checkout_branch);
-	ClassDB::bind_method(D_METHOD("git_pull", "remote"), &GitPlugin::_pull);
-	ClassDB::bind_method(D_METHOD("git_push", "remote", "force"), &GitPlugin::_push);
-	ClassDB::bind_method(D_METHOD("git_fetch", "remote"), &GitPlugin::_fetch);
-	ClassDB::bind_method(D_METHOD("git_get_line_diff", "file_path", "text"), &GitPlugin::_get_line_diff);
+	ClassDB::bind_method(D_METHOD("git_initialize", "project_path"), &Git::_initialize);
+	ClassDB::bind_method(D_METHOD("git_set_credentials", "username", "password", "ssh_public_key_path", "ssh_private_key_path", "ssh_passphrase"), &Git::_set_credentials);
+	ClassDB::bind_method(D_METHOD("git_get_modified_files_data"), &Git::_get_modified_files_data);
+	ClassDB::bind_method(D_METHOD("git_stage_file", "file_path"), &Git::_stage_file);
+	ClassDB::bind_method(D_METHOD("git_unstage_file", "file_path"), &Git::_unstage_file);
+	ClassDB::bind_method(D_METHOD("git_discard_file", "file_path"), &Git::_discard_file);
+	ClassDB::bind_method(D_METHOD("git_commit", "msg", "amend"), &Git::_commit);
+	ClassDB::bind_method(D_METHOD("git_allow_amends"), &Git::_allow_amends);
+	ClassDB::bind_method(D_METHOD("git_get_diff", "identifier", "area"), &Git::_get_diff);
+	ClassDB::bind_method(D_METHOD("git_shut_down"), &Git::_shut_down);
+	ClassDB::bind_method(D_METHOD("git_get_vcs_name"), &Git::_get_vcs_name);
+	ClassDB::bind_method(D_METHOD("git_get_previous_commits", "max_commits"), &Git::_get_previous_commits);
+	ClassDB::bind_method(D_METHOD("git_get_branch_list"), &Git::_get_branch_list);
+	ClassDB::bind_method(D_METHOD("git_get_remotes"), &Git::_get_remotes);
+	ClassDB::bind_method(D_METHOD("git_create_branch", "branch_name"), &Git::_create_branch);
+	ClassDB::bind_method(D_METHOD("git_remove_branch", "branch_name"), &Git::_remove_branch);
+	ClassDB::bind_method(D_METHOD("git_create_remote", "remote_name", "remote_url"), &Git::_create_remote);
+	ClassDB::bind_method(D_METHOD("git_remove_remote", "remote_name"), &Git::_remove_remote);
+	ClassDB::bind_method(D_METHOD("git_get_current_branch_name"), &Git::_get_current_branch_name);
+	ClassDB::bind_method(D_METHOD("git_checkout_branch", "branch_name"), &Git::_checkout_branch);
+	ClassDB::bind_method(D_METHOD("git_pull", "remote"), &Git::_pull);
+	ClassDB::bind_method(D_METHOD("git_push", "remote", "force"), &Git::_push);
+	ClassDB::bind_method(D_METHOD("git_fetch", "remote"), &Git::_fetch);
+	ClassDB::bind_method(D_METHOD("git_get_line_diff", "file_path", "text"), &Git::_get_line_diff);
 	// Doesn't seem to require binding functions for now
 }
 
-GitPlugin::GitPlugin() {
+Git::Git() {
 	map_changes[GIT_STATUS_WT_NEW] = CHANGE_TYPE_NEW;
 	map_changes[GIT_STATUS_INDEX_NEW] = CHANGE_TYPE_NEW;
 	map_changes[GIT_STATUS_WT_MODIFIED] = CHANGE_TYPE_MODIFIED;
@@ -178,7 +183,7 @@ GitPlugin::GitPlugin() {
 	_attach_bridge_script();
 }
 
-bool GitPlugin::check_errors(int error, String function, String file, int line, String message, const std::vector<git_error_code> &ignores) {
+bool Git::check_errors(int error, String function, String file, int line, String message, const std::vector<git_error_code> &ignores) {
 	const git_error *lg2err;
 
 	if (error == 0) {
@@ -197,11 +202,11 @@ bool GitPlugin::check_errors(int error, String function, String file, int line, 
 		message = message + String::utf8(lg2err->message);
 	}
 
-	ERR_PRINT(vformat("GitPlugin: {0} in {1}:{2}#L{3}", message, file, function, line));
+	ERR_PRINT(vformat("Git: {0} in {1}:{2}#L{3}", message, file, function, line));
 	return true;
 }
 
-void GitPlugin::_set_credentials(const String &username, const String &password, const String &ssh_public_key_path, const String &ssh_private_key_path, const String &ssh_passphrase) {
+void Git::_set_credentials(const String &username, const String &password, const String &ssh_public_key_path, const String &ssh_private_key_path, const String &ssh_passphrase) {
 	creds.username = username;
 	creds.password = password;
 	creds.ssh_public_key_path = ssh_public_key_path;
@@ -209,7 +214,7 @@ void GitPlugin::_set_credentials(const String &username, const String &password,
 	creds.ssh_passphrase = ssh_passphrase;
 }
 
-void GitPlugin::_discard_file(const String &file_path) {
+void Git::_discard_file(const String &file_path) {
 	git_checkout_options opts = GIT_CHECKOUT_OPTIONS_INIT;
 	CString c_path(file_path);
 	char *paths[] = { c_path.data };
@@ -219,7 +224,7 @@ void GitPlugin::_discard_file(const String &file_path) {
 	GIT2_CALL(git_checkout_index(repo.get(), nullptr, &opts), "Could not checkout index");
 }
 
-void GitPlugin::_commit(const String &msg, bool amend) {
+void Git::_commit(const String &msg, bool amend) {
 	git_index_ptr repo_index;
 	GIT2_CALL(git_repository_index(Capture(repo_index), repo.get()), "Could not get repository index");
 
@@ -294,11 +299,11 @@ void GitPlugin::_commit(const String &msg, bool amend) {
 	}
 }
 
-bool GitPlugin::_allow_amends() {
+bool Git::_allow_amends() {
 	return true;
 }
 
-void GitPlugin::_stage_file(const String &file_path) {
+void Git::_stage_file(const String &file_path) {
 	CString c_path(file_path);
 	char *paths[] = { c_path.data };
 	git_strarray array = { paths, 1 };
@@ -309,7 +314,7 @@ void GitPlugin::_stage_file(const String &file_path) {
 	GIT2_CALL(git_index_write(index.get()), "Could not write changes to disk");
 }
 
-void GitPlugin::_unstage_file(const String &file_path) {
+void Git::_unstage_file(const String &file_path) {
 	CString c_path(file_path);
 	char *paths[] = { c_path.data };
 	git_strarray array = { paths, 1 };
@@ -333,7 +338,7 @@ void GitPlugin::_unstage_file(const String &file_path) {
 	}
 }
 
-void GitPlugin::create_gitignore_and_gitattributes() {
+void Git::create_gitignore_and_gitattributes() {
 	if (!FileAccess::exists(repo_project_path + "/.gitignore")) {
 		Ref<FileAccess> file = FileAccess::open(repo_project_path + "/.gitignore", FileAccess::ModeFlags::WRITE);
 		ERR_FAIL_COND(file.is_null());
@@ -366,7 +371,7 @@ void GitPlugin::create_gitignore_and_gitattributes() {
 	}
 }
 
-TypedArray<Dictionary> GitPlugin::_get_modified_files_data() {
+TypedArray<Dictionary> Git::_get_modified_files_data() {
 	TypedArray<Dictionary> stats_files;
 
 	git_status_options opts = GIT_STATUS_OPTIONS_INIT;
@@ -408,7 +413,7 @@ TypedArray<Dictionary> GitPlugin::_get_modified_files_data() {
 	return stats_files;
 }
 
-TypedArray<String> GitPlugin::_get_branch_list() {
+TypedArray<String> Git::_get_branch_list() {
 	git_branch_iterator_ptr it;
 	GIT2_CALL_R(git_branch_iterator_new(Capture(it), repo.get(), GIT_BRANCH_LOCAL), "Could not create branch iterator", TypedArray<Dictionary>());
 
@@ -432,7 +437,7 @@ TypedArray<String> GitPlugin::_get_branch_list() {
 	return branch_names;
 }
 
-void GitPlugin::_create_branch(const String &branch_name) {
+void Git::_create_branch(const String &branch_name) {
 	git_oid head_commit_id;
 	GIT2_CALL(git_reference_name_to_id(&head_commit_id, repo.get(), "HEAD"), "Could not get HEAD commit ID");
 
@@ -443,22 +448,22 @@ void GitPlugin::_create_branch(const String &branch_name) {
 	GIT2_CALL(git_branch_create(Capture(branch_ref), repo.get(), CString(branch_name).data, head_commit.get(), 0), "Could not create branch from HEAD");
 }
 
-void GitPlugin::_create_remote(const String &remote_name, const String &remote_url) {
+void Git::_create_remote(const String &remote_name, const String &remote_url) {
 	git_remote_ptr remote;
 	GIT2_CALL(git_remote_create(Capture(remote), repo.get(), CString(remote_name).data, CString(remote_url).data), "Could not create remote");
 }
 
-void GitPlugin::_remove_branch(const String &branch_name) {
+void Git::_remove_branch(const String &branch_name) {
 	git_reference_ptr branch;
 	GIT2_CALL(git_branch_lookup(Capture(branch), repo.get(), CString(branch_name).data, GIT_BRANCH_LOCAL), "Could not find branch " + branch_name);
 	GIT2_CALL(git_branch_delete(branch.get()), "Could not delete branch reference of " + branch_name);
 }
 
-void GitPlugin::_remove_remote(const String &remote_name) {
+void Git::_remove_remote(const String &remote_name) {
 	GIT2_CALL(git_remote_delete(repo.get(), CString(remote_name).data), "Could not delete remote " + remote_name);
 }
 
-TypedArray<Dictionary> GitPlugin::_get_line_diff(const String &file_path, const String &text) {
+TypedArray<Dictionary> Git::_get_line_diff(const String &file_path, const String &text) {
 	git_diff_options opts = GIT_DIFF_OPTIONS_INIT;
 
 	opts.context_lines = 0;
@@ -487,7 +492,7 @@ TypedArray<Dictionary> GitPlugin::_get_line_diff(const String &file_path, const 
 	return diff_contents;
 }
 
-String GitPlugin::_get_current_branch_name() {
+String Git::_get_current_branch_name() {
 	git_reference_ptr head;
 	GIT2_CALL_R_IGNORE(git_repository_head(Capture(head), repo.get()), "Could not find repository HEAD", "", { GIT_ENOTFOUND COMMA GIT_EUNBORNBRANCH });
 
@@ -505,7 +510,7 @@ String GitPlugin::_get_current_branch_name() {
 	return String::utf8(name);
 }
 
-TypedArray<String> GitPlugin::_get_remotes() {
+TypedArray<String> Git::_get_remotes() {
 	git_strarray remote_array;
 	GIT2_CALL_R(git_remote_list(&remote_array, repo.get()), "Could not get list of remotes", TypedArray<Dictionary>());
 
@@ -517,7 +522,7 @@ TypedArray<String> GitPlugin::_get_remotes() {
 	return remotes;
 }
 
-TypedArray<Dictionary> GitPlugin::_get_previous_commits(int32_t max_commits) {
+TypedArray<Dictionary> Git::_get_previous_commits(int32_t max_commits) {
 	git_revwalk_ptr walker;
 	GIT2_CALL_R(git_revwalk_new(Capture(walker), repo.get()), "Could not create new revwalk", TypedArray<Dictionary>());
 	GIT2_CALL_R(git_revwalk_sorting(walker.get(), GIT_SORT_TIME), "Could not sort revwalk by time", TypedArray<Dictionary>());
@@ -543,8 +548,8 @@ TypedArray<Dictionary> GitPlugin::_get_previous_commits(int32_t max_commits) {
 	return commits;
 }
 
-void GitPlugin::_fetch(const String &remote) {
-	print_line("GitPlugin: Performing fetch from ", remote);
+void Git::_fetch(const String &remote) {
+	print_line("Git: Performing fetch from ", remote);
 
 	git_remote_ptr remote_object;
 	GIT2_CALL(git_remote_lookup(Capture(remote_object), repo.get(), CString(remote).data), "Could not lookup remote \"" + remote + "\"");
@@ -564,11 +569,11 @@ void GitPlugin::_fetch(const String &remote) {
 	opts.callbacks = remote_cbs;
 	GIT2_CALL(git_remote_fetch(remote_object.get(), nullptr, &opts, "fetch"), "Could not fetch data from remote");
 
-	print_line("GitPlugin: Fetch ended");
+	print_line("Git: Fetch ended");
 }
 
-void GitPlugin::_pull(const String &remote) {
-	print_line("GitPlugin: Performing pull from ", remote);
+void Git::_pull(const String &remote) {
+	print_line("Git: Performing pull from ", remote);
 
 	git_remote_ptr remote_object;
 	GIT2_CALL(git_remote_lookup(Capture(remote_object), repo.get(), CString(remote).data), "Could not lookup remote \"" + remote + "\"");
@@ -600,7 +605,7 @@ void GitPlugin::_pull(const String &remote) {
 	GIT2_CALL(git_repository_fetchhead_foreach(repo.get(), fetchhead_foreach_cb, &pull_merge_oid), "Could not read \"FETCH_HEAD\" file");
 
 	if (git_oid_is_zero(&pull_merge_oid)) {
-		ERR_PRINT(vformat("GitPlugin: Could not find remote branch HEAD for {0}. Try pushing the branch first.", branch_name));
+		ERR_PRINT(vformat("Git: Could not find remote branch HEAD for {0}. Try pushing the branch first.", branch_name));
 		return;
 	}
 
@@ -629,7 +634,7 @@ void GitPlugin::_pull(const String &remote) {
 		git_reference_ptr new_target_ref;
 		GIT2_CALL(git_reference_set_target(Capture(new_target_ref), target_ref.get(), &pull_merge_oid, nullptr), "Failed to move HEAD reference");
 
-		print_line("GitPlugin: Fast Forwarded");
+		print_line("Git: Fast Forwarded");
 		GIT2_CALL(git_repository_state_cleanup(repo.get()), "Could not clean repository state");
 
 	} else if (merge_analysis & GIT_MERGE_ANALYSIS_NORMAL) {
@@ -645,27 +650,27 @@ void GitPlugin::_pull(const String &remote) {
 		GIT2_CALL(git_repository_index(Capture(index), repo.get()), "Could not get repository index");
 
 		if (git_index_has_conflicts(index.get())) {
-			ERR_PRINT("GitPlugin: Index has conflicts. Solve conflicts and make a merge commit.");
+			ERR_PRINT("Git: Index has conflicts. Solve conflicts and make a merge commit.");
 		} else {
-			ERR_PRINT("GitPlugin: Changes are staged. Make a merge commit.");
+			ERR_PRINT("Git: Changes are staged. Make a merge commit.");
 		}
 
 		has_merge = true;
 
 	} else if (merge_analysis & GIT_MERGE_ANALYSIS_UP_TO_DATE) {
-		print_line("GitPlugin: Already up to date");
+		print_line("Git: Already up to date");
 
 		GIT2_CALL(git_repository_state_cleanup(repo.get()), "Could not clean repository state");
 
 	} else {
-		ERR_PRINT("GitPlugin: Can not merge");
+		ERR_PRINT("Git: Can not merge");
 	}
 
-	print_line("GitPlugin: Pull ended");
+	print_line("Git: Pull ended");
 }
 
-void GitPlugin::_push(const String &remote, bool force) {
-	print_line("GitPlugin: Performing push to ", remote);
+void Git::_push(const String &remote, bool force) {
+	print_line("Git: Performing push to ", remote);
 
 	git_remote_ptr remote_object;
 	GIT2_CALL(git_remote_lookup(Capture(remote_object), repo.get(), CString(remote).data), "Could not lookup remote \"" + remote + "\"");
@@ -692,10 +697,10 @@ void GitPlugin::_push(const String &remote, bool force) {
 
 	GIT2_CALL(git_remote_push(remote_object.get(), &refspec, &push_options), "Failed to push");
 
-	print_line("GitPlugin: Push ended");
+	print_line("Git: Push ended");
 }
 
-bool GitPlugin::_checkout_branch(const String &branch_name) {
+bool Git::_checkout_branch(const String &branch_name) {
 	git_reference_ptr branch;
 	GIT2_CALL_R(git_branch_lookup(Capture(branch), repo.get(), CString(branch_name).data, GIT_BRANCH_LOCAL), "Could not find branch", false);
 	const char *branch_ref_name = git_reference_name(branch.get());
@@ -711,7 +716,7 @@ bool GitPlugin::_checkout_branch(const String &branch_name) {
 	return true;
 }
 
-TypedArray<Dictionary> GitPlugin::_get_diff(const String &identifier, const int32_t area) {
+TypedArray<Dictionary> Git::_get_diff(const String &identifier, const int32_t area) {
 	git_diff_options opts = GIT_DIFF_OPTIONS_INIT;
 	TypedArray<Dictionary> diff_contents;
 
@@ -772,7 +777,7 @@ TypedArray<Dictionary> GitPlugin::_get_diff(const String &identifier, const int3
 	return diff_contents;
 }
 
-TypedArray<Dictionary> GitPlugin::_parse_diff(git_diff *diff) {
+TypedArray<Dictionary> Git::_parse_diff(git_diff *diff) {
 	TypedArray<Dictionary> diff_contents;
 	for (int i = 0; i < git_diff_num_deltas(diff); i++) {
 		const git_diff_delta *delta = git_diff_get_delta(diff, i);
@@ -815,11 +820,11 @@ TypedArray<Dictionary> GitPlugin::_parse_diff(git_diff *diff) {
 	return diff_contents;
 }
 
-String GitPlugin::_get_vcs_name() {
+String Git::_get_vcs_name() {
 	return "Git";
 }
 
-bool GitPlugin::_initialize(const String &project_path) {
+bool Git::_initialize(const String &project_path) {
 
 	ERR_FAIL_COND_V(project_path == "", false);
 
@@ -863,15 +868,15 @@ bool GitPlugin::_initialize(const String &project_path) {
 	int error = git_libgit2_opts(GIT_OPT_SET_SSL_CERT_LOCATIONS, cafile.utf8().get_data(), NULL);
 	DirAccess::remove_absolute(cafile); // Always remove the file
 	if (unlikely(error)) {
-		ERR_PRINT("GitPlugin: Failed to load CA bundle: " + cafile + ", error: " + itos(error));
+		ERR_PRINT("Git: Failed to load CA bundle: " + cafile + ", error: " + itos(error));
 	} else {
-		print_line("GitPlugin: Loaded system CA certificates");
+		print_line("Git: Loaded system CA certificates");
 	}
 
 	return true;
 }
 
-bool GitPlugin::_shut_down() {
+bool Git::_shut_down() {
 	repo.reset(); // Destroy repo object before libgit2 shuts down
 	GIT2_CALL_R(git_libgit2_shutdown(), "Could not shutdown Git Plugin", false);
 	return true;

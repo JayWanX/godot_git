@@ -1,6 +1,5 @@
 #include "register_types.h"
 
-#include "core/config/project_settings.h"
 #include "core/object/class_db.h"
 
 #include "src/git.h"

@@ -4,6 +4,7 @@
 
 #include <git2/tree.h>
 #include "core/object/class_db.h"
+#include "core/object/script_instance.h" // ScriptInstance::has_method（挂载诊断用）
 #include "core/io/file_access.h"
 #include "core/io/dir_access.h"
 #include "core/os/os.h"
@@ -48,80 +49,96 @@
 // GDExtension 覆写），引擎内部 C++ 无法 override。这里在对象构造时挂一个
 // 内存中的 GDScript，把每个回调转发回本类的 C++ 实现，从而在完全不修改
 // 引擎源码的前提下以原生模块提供 VCS 功能。
+//
+// 设计约束（两条都是实测踩过的坑）：
+// 1. 必须 extends EditorVCSInterface：GDScript 解析原生类只认
+//    GDScriptLanguage::init() 建立的 ClassDB 快照表（gdscript.cpp:2159，
+//    gdscript_compiler.cpp:122），模块在编辑器级注册的类不在可靠解析
+//    路径上，而基类 EditorVCSInterface 一定在表里。
+// 2. 转发一律用动态 call("git_xxx", ...)：静态写 git_xxx(...) 会在编译期
+//    被解析到 extends 声明的基类上（报 "Function ... not found in base
+//    self"）；动态 call 运行时走 Object::callp——脚本实例查不到该方法时
+//    回落到 ClassDB::get_method（object.cpp:820），正好命中 Git 上
+//    bind_method 绑定的 C++ 实现。
+// 3. 必须 @tool：编辑器启动时会把 ScriptServer::set_scripting_enabled(false)
+//    （editor_node.cpp:8388），非 tool 脚本的 can_instantiate() 随之为 false，
+//    set_script 会静默创建占位实例——has_method 照样报 true 但调用永远失败，
+//    GDVIRTUAL 派发即报 "must be overridden"。@tool 让脚本在编辑器内可实例化。
 static const char *GIT_BRIDGE_SCRIPT = R"BRIDGE(
+@tool
 extends EditorVCSInterface
 
 func _initialize(project_path: String) -> bool:
-	return git_initialize(project_path)
+	return call("git_initialize", project_path)
 
 func _set_credentials(username: String, password: String, ssh_public_key_path: String, ssh_private_key_path: String, ssh_passphrase: String) -> void:
-	git_set_credentials(username, password, ssh_public_key_path, ssh_private_key_path, ssh_passphrase)
+	call("git_set_credentials", username, password, ssh_public_key_path, ssh_private_key_path, ssh_passphrase)
 
 func _get_modified_files_data() -> Array:
-	return git_get_modified_files_data()
+	return call("git_get_modified_files_data")
 
 func _stage_file(file_path: String) -> void:
-	git_stage_file(file_path)
+	call("git_stage_file", file_path)
 
 func _unstage_file(file_path: String) -> void:
-	git_unstage_file(file_path)
+	call("git_unstage_file", file_path)
 
 func _discard_file(file_path: String) -> void:
-	git_discard_file(file_path)
+	call("git_discard_file", file_path)
 
 func _commit(msg: String, amend: bool) -> void:
-	git_commit(msg, amend)
+	call("git_commit", msg, amend)
 
 func _allow_amends() -> bool:
-	return git_allow_amends()
+	return call("git_allow_amends")
 
 func _get_diff(identifier: String, area: int) -> Array:
-	return git_get_diff(identifier, area)
+	return call("git_get_diff", identifier, area)
 
 func _shut_down() -> bool:
-	return git_shut_down()
+	return call("git_shut_down")
 
 func _get_vcs_name() -> String:
-	return git_get_vcs_name()
+	return call("git_get_vcs_name")
 
 func _get_previous_commits(max_commits: int) -> Array:
-	return git_get_previous_commits(max_commits)
+	return call("git_get_previous_commits", max_commits)
 
 func _get_branch_list() -> Array:
-	return git_get_branch_list()
+	return call("git_get_branch_list")
 
 func _get_remotes() -> Array:
-	return git_get_remotes()
+	return call("git_get_remotes")
 
 func _create_branch(branch_name: String) -> void:
-	git_create_branch(branch_name)
+	call("git_create_branch", branch_name)
 
 func _remove_branch(branch_name: String) -> void:
-	git_remove_branch(branch_name)
+	call("git_remove_branch", branch_name)
 
 func _create_remote(remote_name: String, remote_url: String) -> void:
-	git_create_remote(remote_name, remote_url)
+	call("git_create_remote", remote_name, remote_url)
 
 func _remove_remote(remote_name: String) -> void:
-	git_remove_remote(remote_name)
+	call("git_remove_remote", remote_name)
 
 func _get_current_branch_name() -> String:
-	return git_get_current_branch_name()
+	return call("git_get_current_branch_name")
 
 func _checkout_branch(branch_name: String) -> bool:
-	return git_checkout_branch(branch_name)
+	return call("git_checkout_branch", branch_name)
 
 func _pull(remote: String) -> void:
-	git_pull(remote)
+	call("git_pull", remote)
 
 func _push(remote: String, force: bool) -> void:
-	git_push(remote, force)
+	call("git_push", remote, force)
 
 func _fetch(remote: String) -> void:
-	git_fetch(remote)
+	call("git_fetch", remote)
 
 func _get_line_diff(file_path: String, text: String) -> Array:
-	return git_get_line_diff(file_path, text)
+	return call("git_get_line_diff", file_path, text)
 )BRIDGE";
 
 void Git::_attach_bridge_script() {
@@ -131,7 +148,10 @@ void Git::_attach_bridge_script() {
 	Ref<GDScript> bridge;
 	bridge.instantiate();
 	bridge->set_source_code(String::utf8(GIT_BRIDGE_SCRIPT));
-	bridge->reload();
+	Error err = bridge->reload();
+	if (err != OK) {
+		ERR_PRINT(vformat("Git: bridge script failed to compile (error %d), VCS integration will not work.", (int)err));
+	}
 	set_script(bridge);
 #else
 	ERR_PRINT_ONCE("Git: GDScript module is required for the VCS bridge.");

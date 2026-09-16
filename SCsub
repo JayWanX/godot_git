@@ -1,0 +1,48 @@
+#!/usr/bin/env python
+
+# godot_git 模块构建入口：把插件源码编进引擎，并链接预先用 cmake 编好的第三方静态库。
+#
+# 第三方库产物来源（一次性，由仓库根的 SConstruct / cmake 生成）：
+#   bin/thirdparty/git2/windows/x86_64/git2.lib              （libgit2，USE_HTTPS=OpenSSL + GIT_SSH=libssh2）
+#   bin/thirdparty/ssh2/windows/x86_64/src/libssh2.lib       （libssh2，CRYPTO_BACKEND=OpenSSL）
+#   bin/thirdparty/openssl/windows/x86_64/libssl.lib         （OpenSSL 静态库，nmake 构建根目录；
+#    bin/thirdparty/openssl/windows/x86_64/libcrypto.lib      dest/lib/ 下另有一份拷贝，链接用的是根目录这份）
+#
+# pyright: reportUndefinedVariable = none
+
+Import("env")
+Import("env_modules")
+
+env_git = env_modules.Clone()
+
+# 本模块目录的绝对路径（SCons 在处理本 SCsub 时，Dir(".") 即模块目录）
+module_dir = Dir(".").abspath
+
+# libgit2 公开头（src/*.cpp 只需要 git2.h；libgit2 内部源码不在本模块编译，无需 gen_headers）
+env_git.Append(CPPPATH=[
+	module_dir + "/thirdparty/git2/libgit2/include",
+])
+
+# 本模块源码（根目录的 register_types.cpp 需单独登记：SCons 的 src/*.cpp 不含根目录文件）
+env_git.add_source_files(env.modules_sources, "*.cpp")
+env_git.add_source_files(env.modules_sources, "src/*.cpp")
+
+# 链接第三方静态库（Windows / MSVC）
+# 注意：最终 exe 由 base env 链接，模块 Clone 环境上的 LIBS/LIBPATH 不会传播到链接步骤，
+# 因此这里必须追加到 Import 进来的 env 上。
+if env["platform"] == "windows":
+	env.Append(LIBPATH=[
+		module_dir + "/bin/thirdparty/git2/windows/x86_64",
+		module_dir + "/bin/thirdparty/ssh2/windows/x86_64/src",
+		module_dir + "/bin/thirdparty/openssl/windows/x86_64",
+	])
+	# 顺序敏感：git2 依赖 libssh2 与 libcrypto，必须排在被依赖者之前
+	# 注意不能用 LIBS：SConstruct 给 base env 设了自定义 LIBSUFFIX（.windows.editor.double.x86_64.lib），
+	# 裸库名会被展开成 git2.windows.editor.double.x86_64.lib 这类不存在的文件。
+	# 引擎自身的系统库也是这么处理的（platform/windows/detect.py 中 LIBS 统一拼进 LINKFLAGS）。
+	env.Append(LINKFLAGS=[
+		"git2.lib", "libssh2.lib", "libssl.lib", "libcrypto.lib",
+		# libgit2 / OpenSSL 在 Windows 上需要的系统库（与上游 SCsub 一致）
+		"winhttp.lib", "rpcrt4.lib", "crypt32.lib", "ole32.lib", "user32.lib",
+		"advapi32.lib", "wsock32.lib", "ws2_32.lib", "bcrypt.lib",
+	])

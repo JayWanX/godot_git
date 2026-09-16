@@ -2,7 +2,7 @@
 
 #include <memory>
 
-#include "godot_cpp/variant/string.hpp"
+#include "core/string/ustring.h"
 #include "git2.h"
 
 class GitPlugin;
@@ -10,7 +10,7 @@ class GitPlugin;
 struct CString {
 	char *data = nullptr;
 
-	CString(const godot::String &string);
+	CString(const String &string);
 	~CString();
 	CString() = delete;
 	CString(CString &&) = delete;

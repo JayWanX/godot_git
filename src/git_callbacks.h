@@ -1,12 +1,12 @@
 #pragma once
 
-#include "godot_cpp/variant/array.hpp"
+#include "core/variant/array.h"
 #include "git2.h"
 
 class GitPlugin;
 
 struct DiffHelper {
-	godot::Array *diff_hunks;
+	Array *diff_hunks;
 	GitPlugin *git_plugin;
 };
 

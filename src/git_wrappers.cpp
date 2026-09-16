@@ -2,8 +2,8 @@
 
 #include <cstring>
 
-CString::CString(const godot::String &string) {
-	godot::CharString godot_char_str = string.utf8();
+CString::CString(const String &string) {
+	CharString godot_char_str = string.utf8();
 
 	data = new char[godot_char_str.length() + 1];
 	std::memcpy(data, (void *)godot_char_str.get_data(), godot_char_str.length());

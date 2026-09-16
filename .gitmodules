@@ -1,10 +1,12 @@
 [submodule "thirdparty/git2/libgit2"]
 	path = thirdparty/git2/libgit2
 	url = https://github.com/libgit2/libgit2
-	ignore = untracked
+	ignore = all
 [submodule "thirdparty/ssh2/libssh2"]
 	path = thirdparty/ssh2/libssh2
 	url = https://github.com/libssh2/libssh2
+	ignore = all
 [submodule "thirdparty/openssl"]
 	path = thirdparty/openssl
 	url = https://github.com/openssl/openssl
+	ignore = all

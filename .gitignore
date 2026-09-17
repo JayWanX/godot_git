@@ -5,6 +5,10 @@
 extension_api.json
 !/ci/extension_api.json
 
+# SCons-generated compile database: ~6 MB of absolute local paths, no value
+# to anyone cloning the repo.
+compile_commands.json
+
 # Visual Studio Cache
 .vs/
 

@@ -1,12 +1,18 @@
 #!/usr/bin/env python
 
-# godot_git 模块构建入口：把模块源码编进引擎，并链接预先用 cmake 编好的第三方静态库。
+# godot_git 模块构建入口：把模块源码编进引擎，并链接预先编好的第三方静态库。
 #
-# 第三方库产物来源（一次性，由仓库根的 SConstruct / cmake 生成）：
-#   bin/thirdparty/git2/windows/x86_64/git2.lib              （libgit2，USE_HTTPS=OpenSSL + GIT_SSH=libssh2）
+# 第三方库产物由同目录的 build_thirdparty.py 生成（SCons 不会进入 thirdparty/，
+# 只链接现成的静态库；而 bin/ 被 .gitignore 排除，所以干净 clone 必须先跑那个脚本）：
+#   bin/thirdparty/<lib>/<platform>/<arch>/…
+# 以本机 windows/x86_64 为例：
+#   bin/thirdparty/git2/windows/x86_64/git2.lib              （libgit2，USE_HTTPS=OpenSSL + USE_SSH=libssh2）
 #   bin/thirdparty/ssh2/windows/x86_64/src/libssh2.lib       （libssh2，CRYPTO_BACKEND=OpenSSL）
-#   bin/thirdparty/openssl/windows/x86_64/libssl.lib         （OpenSSL 静态库，nmake 构建根目录；
+#   bin/thirdparty/openssl/windows/x86_64/libssl.lib         （OpenSSL 静态库，构建目录根部；
 #    bin/thirdparty/openssl/windows/x86_64/libcrypto.lib      dest/lib/ 下另有一份拷贝，链接用的是根目录这份）
+#
+# 目前只有 Windows 这一支写了链接参数：其它平台的库文件名与系统库清单都不一样，
+# 需要时按同一套目录约定补。脚本本身是跨平台的。
 #
 # pyright: reportUndefinedVariable = none
 
@@ -30,11 +36,19 @@ env_git.add_source_files(env.modules_sources, "src/*.cpp")
 # 链接第三方静态库（Windows / MSVC）
 # 注意：最终 exe 由 base env 链接，模块 Clone 环境上的 LIBS/LIBPATH 不会传播到链接步骤，
 # 因此这里必须追加到 Import 进来的 env 上。
+#
+# 产物目录由 build_thirdparty.py 生成，两边用同一套命名：
+#   bin/thirdparty/<lib>/<platform>/<arch>/
+# 所以这里也从 env 取 platform/arch，不写死成 windows/x86_64 —— 换个平台或
+# 架构构建时，脚本产出的位置和这里找的位置才对得上。
 if env["platform"] == "windows":
+	thirdparty_dir = module_dir + "/bin/thirdparty"
+	plat_arch = env["platform"] + "/" + env["arch"]
+
 	env.Append(LIBPATH=[
-		module_dir + "/bin/thirdparty/git2/windows/x86_64",
-		module_dir + "/bin/thirdparty/ssh2/windows/x86_64/src",
-		module_dir + "/bin/thirdparty/openssl/windows/x86_64",
+		thirdparty_dir + "/git2/" + plat_arch,
+		thirdparty_dir + "/ssh2/" + plat_arch + "/src",
+		thirdparty_dir + "/openssl/" + plat_arch,
 	])
 	# 顺序敏感：git2 依赖 libssh2 与 libcrypto，必须排在被依赖者之前
 	# 注意不能用 LIBS：SConstruct 给 base env 设了自定义 LIBSUFFIX（.windows.editor.double.x86_64.lib），

@@ -563,6 +563,44 @@ TypedArray<Dictionary> Git::_get_modified_files_data() {
 	return result;
 }
 
+// 引擎在 Windows 上保存文件时会短暂生成两类临时文件，都要从变更列表里剔掉：
+//   <名><数字>.tmp        —— 备份保存路径，drivers/windows/file_access_windows.cpp:200-215
+//   <名>~RF<十六进制>.TMP —— 同文件 :254 的 ReplaceFileW 做原子替换时由 Windows 内部
+//                            创建的中间名（引擎源码里搜不到这个命名，不是它拼出来的）
+// 两者都只存在几毫秒、且可能被独占打开：列进面板不过是闪现的伪变更，而等后台线程去
+// 算 diff 时文件往往已经消失，libgit2 报 ENOTFOUND(-3)，会把整个文件的 diff 一起毁掉。
+//
+// 判据必须对扩展名做大小写归一：String::get_extension() 只按最后一个 '.' 截取、**不转
+// 小写**（core/string/ustring.cpp:5034-5041），而这两类的扩展名一个是 .tmp、一个是
+// .TMP —— 只比字面量 "tmp" 就会漏掉后者（实机踩到的正是这一条）。
+bool Git::_is_transient_engine_file(const String &p_path) {
+	if (p_path.get_extension().to_lower() != "tmp") {
+		return false;
+	}
+
+	const String base = p_path.get_basename(); // 去掉扩展名，如 "icons_data.tres~RF56c1f6"
+	if (base.is_empty()) {
+		return false;
+	}
+
+	if (base[base.length() - 1] >= '0' && base[base.length() - 1] <= '9') { // <名><数字>.tmp
+		return true;
+	}
+
+	const int marker = base.rfind("~RF"); // <名>~RF<十六进制>.TMP
+	if (marker < 0 || marker + 3 >= base.length()) {
+		return false;
+	}
+	for (int i = marker + 3; i < base.length(); i++) {
+		const char32_t c = base[i];
+		const bool is_hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+		if (!is_hex) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void Git::_scan_status_into(git_repository *p_repo, std::vector<StatusEntry> &r_out) {
 	// 全量扫描工作区 + 索引状态，输出纯数据条目（不构造 Dictionary，
 	// 因此可在后台线程安全调用）。失败时输出空列表并打印错误。
@@ -590,14 +628,17 @@ void Git::_scan_status_into(git_repository *p_repo, std::vector<StatusEntry> &r_
 			path = String::utf8(entry->head_to_index->new_file.path);
 		}
 
-		// 跳过引擎 Windows 原子保存的瞬态临时文件（file_access_windows.cpp:204，
-		// 命名规则「原文件名 + 数字 + .tmp」）。这类文件只存在几毫秒且被编辑器
-		// 独占打开——读它做 diff 会报共享冲突，列进面板也只是闪现的伪变更。
-		{
-			String base = path.get_basename();
-			if (path.get_extension() == "tmp" && !base.is_empty() && base[base.length() - 1] >= '0' && base[base.length() - 1] <= '9') {
-				continue;
-			}
+		// 跳过引擎/Windows 原子保存产生的瞬态临时文件，命名规则见
+		// _is_transient_engine_file()。它们在被扫到的下一刻就可能消失，
+		// 留在列表里只会让面板闪现伪变更、并让后台 diff 报错。
+		//
+		// 额外要求"未被跟踪"：命名判据本身是启发式的（末位数字那条尤其宽），
+		// 而引擎的中间产物一定是刚建立、尚未纳入版本控制的新文件。加这一道
+		// 闸门后，仓库里即使真有一个叫 data1.TMP 的被跟踪文件，它的改动也
+		// 不会被悄悄藏掉 —— 过滤只可能作用于未跟踪的新增项。
+		const bool untracked = (entry->status & GIT_STATUS_WT_NEW) != 0;
+		if (untracked && _is_transient_engine_file(path)) {
+			continue;
 		}
 
 		const static int git_status_wt = GIT_STATUS_WT_NEW | GIT_STATUS_WT_MODIFIED | GIT_STATUS_WT_DELETED | GIT_STATUS_WT_TYPECHANGE | GIT_STATUS_WT_RENAMED | GIT_STATUS_CONFLICTED;
@@ -1290,7 +1331,16 @@ TypedArray<Dictionary> Git::_parse_diff(git_diff *diff) {
 		const git_diff_delta *delta = git_diff_get_delta(diff, i);
 
 		git_patch_ptr patch;
-		GIT2_CALL_R(git_patch_from_diff(Capture(patch), diff, i), "Could not create patch from diff", TypedArray<Dictionary>());
+		const int patch_error = git_patch_from_diff(Capture(patch), diff, i);
+		if (patch_error != 0) {
+			// 建不出单个 delta 的 patch 不该毁掉整份 diff。最常见的原因是文件在 status
+			// 扫描之后、这里之前消失了（引擎原子保存的瞬态临时文件、或用户刚删掉的文件），
+			// libgit2 给的是 ENOTFOUND(-3)。跳过这一条，其余 delta 照常返回。
+			if (patch_error == GIT_ENOTFOUND) {
+				continue;
+			}
+			GIT2_CALL_R(patch_error, "Could not create patch from diff", TypedArray<Dictionary>());
+		}
 
 		Dictionary diff_file = create_diff_file(String::utf8(delta->new_file.path), String::utf8(delta->old_file.path));
 

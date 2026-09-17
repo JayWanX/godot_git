@@ -163,6 +163,7 @@ private:
 	void _bg_main();
 	void _on_filesystem_changed(); // 主线程：编辑器文件系统变更信号 → 请求后台扫描
 	void _scan_status_into(git_repository *p_repo, std::vector<StatusEntry> &r_out);
+	static bool _is_transient_engine_file(const String &p_path); // 引擎原子保存的瞬态临时文件
 	static bool _status_equal(const std::vector<StatusEntry> &p_a, const std::vector<StatusEntry> &p_b);
 	TypedArray<Dictionary> _status_to_array(const std::vector<StatusEntry> &p_entries);
 	void _sync_refresh_status();

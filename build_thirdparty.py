@@ -31,9 +31,12 @@ build_thirdparty.py —— 构建 godot_git 模块所链接的三个第三方静
       git submodule update --init <缺失的路径>（--no-init 可禁用）。
       于是「干净 clone + 一份工具链 + 本脚本」就是全部输入。
     - CMake 与 Perl 可调用（Perl 是 OpenSSL 的 Configure 需要的，绕不开）
-    - Windows 下还需在 "x64 Native Tools Command Prompt for VS" 里运行
-      （cl.exe 与 nmake.exe 在 PATH 上；那个命令行同时把 MSVC 的
-      include/lib 环境摆好，cmake 靠它识别编译器）
+    - Windows 下需要一个 MSVC 工具集（Visual Studio 或 Build Tools 的 C++ 工作负载）。
+      include/lib 环境由脚本自己调 vcvarsall.bat 建立，不必先手工开
+      "x64 Native Tools Command Prompt"：机器级的 INCLUDE/LIB 环境变量常常是
+      手工拼的残缺版本（本机就只有 include/ucrt/um 三段、缺 shared，于是
+      windows.h 里的 winapifamily.h 找不到，nmake 报 C1083），所以一律以
+      vcvarsall 给出的完整集合为准（VCVARSALL 环境变量可指定用它哪一份）
     - 不需要 NASM：OpenSSL 统一以 no-asm 配置（与仓库里已验证的那份产出一致）
 
 重复运行是安全的：cmake 复用既有 cache，nmake/make 做增量编译，改一行
@@ -41,6 +44,7 @@ build_thirdparty.py —— 构建 godot_git 模块所链接的三个第三方静
 """
 
 import argparse
+import locale
 import os
 import platform as host_platform
 import re
@@ -276,6 +280,121 @@ def resolve_tool(env_var, candidates, probe_args, hint):
     )
 
 
+# vcvarsall.bat 用的是 VS 自己的架构命名（主机_目标），与本脚本的 arch 名不同。
+VCVARSALL_ARCH = {
+    "x86_64": "x64",
+    "x86_32": "x86",
+    "arm64": "arm64",
+    "arm32": "x86_arm",
+}
+
+# 这几个变量交给 vcvarsall 全权重建。调用前必须从子进程环境里摘掉：vcvarsall
+# 是"把新值插到已有值前面"（prepend），不清空就会让旧的残缺列表留在尾部——
+# 本机的机器级 INCLUDE 只有 include/ucrt/um 三段，正是那份残缺列表把构建卡死的，
+# 留着它只会在同名头文件上引入不确定的搜索顺序。
+MSVC_ENV_KEYS = ("INCLUDE", "LIB", "LIBPATH")
+
+
+def find_vcvarsall():
+    """定位 vcvarsall.bat；找不到返回 None。
+
+    顺序是 VCVARSALL 环境变量 -> vswhere。用 vswhere 而不是猜安装路径：它由
+    VS 安装器放在固定位置，且把 Build Tools 与完整 IDE 一视同仁地列出来，
+    不依赖当前 PATH 里有什么。
+    """
+    override = os.environ.get("VCVARSALL", "").strip()
+    if override:
+        return override if Path(override).is_file() else None
+
+    vswhere = which("vswhere")
+    if not vswhere:
+        # vswhere 的位置与 VS 版本、安装盘符无关，是安装器的固定组件
+        installer = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+        probe = installer / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+        vswhere = str(probe) if probe.is_file() else None
+    if not vswhere:
+        return None
+
+    try:
+        proc = subprocess.run(
+            [vswhere, "-latest", "-products", "*", "-property", "installationPath"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            errors="replace",
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+
+    for root in (proc.stdout or "").splitlines():
+        root = root.strip()
+        if not root:
+            continue
+        candidate = Path(root) / "VC" / "Auxiliary" / "Build" / "vcvarsall.bat"
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def load_msvc_environment(ctx):
+    """在 Windows 上用 vcvarsall.bat 建立完整的 MSVC 环境，成功返回 True。
+
+    为什么不直接沿用进程里的 INCLUDE/LIB：这两个变量在 Windows 上是全局持久
+    的，常被手工设成残缺版本——本机的机器级变量就只有 include/ucrt/um 三段，
+    少了 shared，于是 windows.h 里的 winapifamily.h 找不到，OpenSSL 的 nmake
+    报 C1083 直接停工，而报错信息只会说"无法打开包括文件"，指不到环境变量上。
+    vcvarsall 给出的是该工具集权威且完整的集合，所以以它为准：这是一次
+    "让脏环境失效"的动作，而不是在一份可疑的列表上打补丁。
+
+    vcvarsall.bat 是批处理，必须经 cmd 调用；用 `call ... && set` 把改完的
+    环境整份取回来注入本进程，之后所有子进程（cmake / nmake / cl）自动继承。
+    """
+    vcvarsall = find_vcvarsall()
+    if not vcvarsall:
+        return False
+
+    arch = VCVARSALL_ARCH.get(ctx.arch)
+    if not arch:
+        die(
+            'no vcvarsall architecture for arch "%s". Pass --arch with one of: %s.'
+            % (ctx.arch, ", ".join(sorted(VCVARSALL_ARCH)))
+        )
+
+    # 这里特意传字符串而不是列表：cmd 的引号规则是"若 /c 之后的命令行以引号
+    # 开头、首尾是一对引号，就剥掉这一对"，内层的路径引号因此原样交给 call。
+    # 交给 subprocess 去拼反而会按 MSVC 规则加 \" 转义，而 cmd 不认那个。
+    cmdline = 'cmd.exe /c "call "%s" %s >nul && set"' % (vcvarsall, arch)
+    # 摘掉旧的 INCLUDE/LIB/LIBPATH 再调（理由见 MSVC_ENV_KEYS 处的注释）。
+    # PATH 必须留着：cmd 要靠它找到 vcvarsall 与被它调用的工具。
+    clean_env = {
+        key: value
+        for key, value in os.environ.items()
+        if key.upper() not in MSVC_ENV_KEYS
+    }
+    proc = subprocess.run(
+        cmdline, env=clean_env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    if proc.returncode != 0:
+        return False
+
+    # `set` 的输出跟随控制台代码页（中文 Windows 上是 936），按本地区编码解。
+    text = (proc.stdout or b"").decode(locale.getpreferredencoding(False), errors="replace")
+    applied = 0
+    for line in text.splitlines():
+        key, sep, value = line.partition("=")
+        # 跳过 "=C:=C:\..." 这类"驱动器当前目录"伪变量：它们的键以 = 开头
+        if not sep or not key or key.startswith("="):
+            continue
+        os.environ[key.upper()] = value
+        applied += 1
+
+    if applied:
+        log("msvc env   : %s (%s)" % (vcvarsall, arch))
+    return applied > 0
+
+
 def default_generator(ctx):
     """按平台挑一个合理的 CMake 生成器。
 
@@ -295,19 +414,27 @@ def resolve_tools(ctx):
     ctx.generator = ctx.args.generator or env_generator or default_generator(ctx)
 
     uses_nmake = "NMake" in ctx.generator
+    if ctx.is_windows:
+        # 先把 MSVC 环境摆好，再去找 cl / nmake：机器级的 INCLUDE/LIB 可能是
+        # 残缺的，那样即使工具都在 PATH 上，编译也会死在找不到 SDK 头上。
+        if not load_msvc_environment(ctx):
+            log("")
+            log("[WARN] vcvarsall.bat was not found; using the environment as-is.")
+            log("       If the build stops on a missing SDK header, run this script")
+            log('       from an "x64 Native Tools Command Prompt for VS", or point')
+            log("       VCVARSALL at vcvarsall.bat explicitly.")
+
     if uses_nmake:
         if not which("cl"):
             die(
                 "cl.exe is not on PATH, so the NMake generator cannot work.\n"
-                '        Open an "x64 Native Tools Command Prompt for VS" and run this\n'
-                "        script from there. That shell also sets the MSVC include/lib\n"
-                "        environment, which is how cmake finds the compiler."
+                "        Install the C++ workload of Visual Studio (or Build Tools),\n"
+                "        or pass --generator to use a compiler that is on PATH."
             )
         if not which("nmake"):
             die(
                 "nmake.exe is not on PATH, so the NMake generator cannot work.\n"
-                '        Open an "x64 Native Tools Command Prompt for VS" and run this\n'
-                "        script from there."
+                "        It ships with the C++ workload of Visual Studio / Build Tools."
             )
 
     ctx.cmake, cmake_src = resolve_tool(
@@ -728,6 +855,7 @@ def parse_args(argv):
             "  MAKE              make/nmake；Windows 默认 nmake，其余默认 make\n"
             "  CMAKE_GENERATOR   CMake 生成器；默认 Windows 用 NMake Makefiles，\n"
             "                    类 Unix 优先 Ninja，否则 Unix Makefiles\n"
+            "  VCVARSALL         vcvarsall.bat 的完整路径；Windows 默认用 vswhere 找\n"
             "\n"
             "示例：\n"
             "  python build_thirdparty.py\n"

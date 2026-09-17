@@ -27,7 +27,9 @@ build_thirdparty.py —— 构建 godot_git 模块所链接的三个第三方静
     它前面的产物必须已经存在。
 
 前置条件
-    - 三个子模块已 checkout：git submodule update --init --recursive
+    - 三个子模块的源码可用。哪个缺了就自动补哪个：
+      git submodule update --init <缺失的路径>（--no-init 可禁用）。
+      于是「干净 clone + 一份工具链 + 本脚本」就是全部输入。
     - CMake 与 Perl 可调用（Perl 是 OpenSSL 的 Configure 需要的，绕不开）
     - Windows 下还需在 "x64 Native Tools Command Prompt for VS" 里运行
       （cl.exe 与 nmake.exe 在 PATH 上；那个命令行同时把 MSVC 的
@@ -59,6 +61,21 @@ SSH2_SRC = TP_DIR / "ssh2" / "libssh2"
 GIT2_SRC = TP_DIR / "git2" / "libgit2"
 
 BIN_DIR = MODULE_ROOT / "bin" / "thirdparty"
+
+# 每个目标的源码是否就位的判据：子模块自己必定带的那个文件。
+SOURCE_MARKERS = {
+    "openssl": OPENSSL_SRC / "Configure",
+    "libssh2": SSH2_SRC / "CMakeLists.txt",
+    "libgit2": GIT2_SRC / "CMakeLists.txt",
+}
+
+# 目标名 -> 子模块源码目录。传给 git 时再转成相对模块根的路径，
+# 不另存一份字符串常量，免得和上面几行走散。
+SUBMODULE_DIRS = {
+    "openssl": OPENSSL_SRC,
+    "libssh2": SSH2_SRC,
+    "libgit2": GIT2_SRC,
+}
 
 # ==============================================================================
 # 平台与架构命名
@@ -332,19 +349,64 @@ def resolve_tools(ctx):
     log("jobs       : %d" % ctx.jobs)
 
 
-def check_sources():
-    missing = []
-    if not (OPENSSL_SRC / "Configure").is_file():
-        missing.append(str(OPENSSL_SRC))
-    if not (SSH2_SRC / "CMakeLists.txt").is_file():
-        missing.append(str(SSH2_SRC))
-    if not (GIT2_SRC / "CMakeLists.txt").is_file():
-        missing.append(str(GIT2_SRC))
-    if missing:
-        die(
-            "third-party sources are missing:\n        %s\n"
-            "        Run: git submodule update --init --recursive" % "\n        ".join(missing)
-        )
+def selected_targets(target):
+    """把 "all" 展开成构建顺序上的一串目标名。（ORDER 定义在本文件后半段。）"""
+    return ORDER if target == "all" else (target,)
+
+
+def source_present(name):
+    return SOURCE_MARKERS[name].is_file()
+
+
+def submodule_args(names):
+    """目标名 -> git 认识的子模块路径（相对模块根、正斜杠）。"""
+    return [SUBMODULE_DIRS[n].relative_to(MODULE_ROOT).as_posix() for n in names]
+
+
+def init_submodules(ctx, names):
+    """为缺失的源码初始化子模块，成功返回 True。
+
+    git 不在 PATH 上时返回 False，交给调用方给出可执行的提示——本脚本的
+    其余部分不需要 git，不该因为补源码这件事把它变成硬依赖。
+    """
+    git = which("git")
+    if not git:
+        return False
+
+    cmd = [git, "submodule", "update", "--init"]
+    if ctx.args.depth > 0:
+        cmd += ["--depth", str(ctx.args.depth)]
+    cmd += submodule_args(names)
+
+    log("")
+    log("third-party sources are missing: %s" % ", ".join(names))
+    log("fetching them now (network access; a first clone can take a while):")
+    rc, _ = run(ctx, cmd, cwd=MODULE_ROOT)
+    return rc == 0
+
+
+def check_sources(ctx, targets):
+    """确保目标所需的源码就位；缺了就自动补，补不上才退出。
+
+    只检查本次要构建的那几个目标：编 libgit2 需要的是 OpenSSL 的 .lib，
+    不是它的源码，所以 Openssl 源码不在不该妨碍这一步。
+    """
+    missing = [t for t in targets if not source_present(t)]
+    if missing and not ctx.args.no_init:
+        init_submodules(ctx, missing)
+        missing = [t for t in missing if not source_present(t)]
+
+    if not missing:
+        return
+
+    die(
+        "third-party sources are missing:\n        %s\n"
+        "        Fetch them with:\n"
+        "        git submodule update --init --recursive\n"
+        "        If that fails it is a network or proxy problem, not something\n"
+        "        this script can work around."
+        % "\n        ".join(submodule_args(missing))
+    )
 
 
 # ==============================================================================
@@ -671,6 +733,7 @@ def parse_args(argv):
             "  python build_thirdparty.py\n"
             "  python build_thirdparty.py libgit2\n"
             "  python build_thirdparty.py --clean all\n"
+            "  python build_thirdparty.py --depth 1 all    # 首次拉源码走浅克隆\n"
             "  CMAKE=/path/to/cmake/bin/cmake python build_thirdparty.py\n"
         ),
     )
@@ -689,6 +752,21 @@ def parse_args(argv):
         "--no-debug-logging",
         action="store_true",
         help="关闭 libssh2 的 DEBUG_LOGGING（库更小，但 LIBSSH2_TRACE 不再生效）",
+    )
+    parser.add_argument(
+        "--no-init",
+        action="store_true",
+        help="源码缺失时不要自动初始化子模块（默认会执行 git submodule update --init）",
+    )
+    parser.add_argument(
+        "--depth",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "子模块浅克隆深度；0 = 完整历史（默认）。浅克隆拉得快，代价是历史被截断，"
+            "之后无法 checkout 任意 tag（例如把 libssh2 对齐到 1.11.1）"
+        ),
     )
     parser.add_argument("--clean", action="store_true", help="构建前删除本平台的构建目录")
     return parser.parse_args(argv)
@@ -715,14 +793,14 @@ def main(argv):
     log("target      : %s" % args.target)
     log("")
 
-    check_sources()
+    selected = selected_targets(args.target)
+    check_sources(ctx, selected)
     if args.clean:
         log("cleaning build directories:")
         clean(ctx)
         log("")
     resolve_tools(ctx)
 
-    selected = ORDER if args.target == "all" else (args.target,)
     for name in selected:
         STEPS[name](ctx)
 

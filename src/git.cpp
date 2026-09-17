@@ -8,8 +8,10 @@
 #include "core/object/callable_mp.h"
 #include "core/io/file_access.h"
 #include "core/io/dir_access.h"
+#include "core/io/config_file.h"
 #include "core/os/os.h"
 #include "editor/file_system/editor_file_system.h"
+#include "editor/file_system/editor_paths.h"
 #include "core/config/project_settings.h"
 #include "core/string/print_string.h"
 #include "core/string/ustring.h"
@@ -228,12 +230,145 @@ bool Git::check_errors(int error, String function, String file, int line, String
 	return true;
 }
 
+// 凭据文件的路径。放在用户的编辑器配置目录下，由 EditorPaths 决定具体位置：
+//   - 普通安装：%APPDATA%/Godot/godot_git/credentials.cfg
+//     （editor_paths.cpp:178 = OS::get_config_path() + godot 目录名）
+//   - 自包含构建（可执行文件旁有 ._sc_ 或 _sc_，本机就是这种）：
+//     <exe 目录>/editor_data/godot_git/credentials.cfg
+//     （editor_paths.cpp:163-170 = data_dir，与 editor_settings-4.7.tres 同处）
+// 选这里而不是项目目录的理由：
+//   1) 凭据属于"这台机器上的这个用户"，不属于仓库 —— 放进项目目录会被提交，
+//      更糟的是会随仓库一起分发出去；
+//   2) 与引擎自己存 username/密钥路径的地方一致，备份与迁移的粒度相同。
+// 用 EditorPaths 而不是自己拼路径，就是为了自动跟上 --self-contained 等情形。
+String Git::_secrets_file_path() {
+	EditorPaths *paths = EditorPaths::get_singleton();
+	if (paths == nullptr) {
+		return String();
+	}
+	const String config_dir = paths->get_config_dir();
+	if (config_dir.is_empty()) {
+		return String();
+	}
+	return config_dir.path_join("godot_git").path_join("credentials.cfg");
+}
+
+void Git::_load_persisted_secrets() {
+	if (secrets_loaded) {
+		return;
+	}
+	secrets_loaded = true;
+
+	const String path = _secrets_file_path();
+	if (path.is_empty()) {
+		// 取不到配置目录：本次会话不持久化。功能不受影响，只是重启后要重填。
+		return;
+	}
+
+	ConfigFile cfg;
+	if (cfg.load(path) != OK) {
+		return; // 首次运行尚无该文件，属正常情况。
+	}
+
+	stored_password = cfg.get_value("credentials", "password", String());
+
+	const Variant passphrases = cfg.get_value("credentials", "passphrases", Dictionary());
+	if (passphrases.get_type() == Variant::DICTIONARY) {
+		stored_passphrases = passphrases;
+	}
+}
+
+void Git::_persist_secrets() {
+	const String path = _secrets_file_path();
+	if (path.is_empty()) {
+		return;
+	}
+
+	const String dir = path.get_base_dir();
+	if (!DirAccess::dir_exists_absolute(dir)) {
+		const Error err = DirAccess::make_dir_recursive_absolute(dir);
+		if (err != OK) {
+			ERR_PRINT(vformat("Git: 无法创建凭据目录 \"%s\"（错误码 %d），SSH 口令与 HTTPS 密码将不会被记住。", dir, (int)err));
+			return;
+		}
+	}
+
+	ConfigFile cfg;
+	cfg.load(path); // 先读后写：保留文件里可能存在的其它键，便于将来扩展
+	cfg.set_value("credentials", "password", stored_password);
+	cfg.set_value("credentials", "passphrases", stored_passphrases);
+
+	const Error err = cfg.save(path);
+	if (err != OK) {
+		ERR_PRINT(vformat("Git: 无法写入凭据文件 \"%s\"（错误码 %d），SSH 口令与 HTTPS 密码将不会被记住。", path, (int)err));
+		// 不改变内存中的值：本次会话仍然可用，只是下次启动要重填。
+		// 此处不引入新的失败语义——持久化只是便利，不该让网络操作失败。
+	}
+}
+
 void Git::_set_credentials(const String &username, const String &password, const String &ssh_public_key_path, const String &ssh_private_key_path, const String &ssh_passphrase) {
+	_load_persisted_secrets();
+
 	creds.username = username;
 	creds.password = password;
 	creds.ssh_public_key_path = ssh_public_key_path;
 	creds.ssh_private_key_path = ssh_private_key_path;
 	creds.ssh_passphrase = ssh_passphrase;
+
+	// —— 口径：空 = 沿用上次填过的值，非空 = 采用并记住 ——
+	//
+	// 必须这么定，而不是把空值当成"用户要清空"。因为引擎在编辑器启动时就会用
+	// 一整套空值调一次本函数（version_control_editor_plugin.cpp:78 的
+	// NOTIFICATION_READY 分支：_load_plugin() 成功后紧接着 _set_credentials()），
+	// 而对话框本身不保存口令与 HTTPS 密码两栏——若把空值当"清空"，存下来的口令
+	// 会在每次启动时被自己抹掉，回到空口令连服务器、报 -16 的老样子。
+	//
+	// 注意规范化后的私钥路径才是归档键，且必须与 credentials_cb 用的是同一个
+	// 结果（normalize_credential_path）：否则同一条路径因粘法不同而分成两个键，
+	// 保存过的口令将永远取不回来。
+	const String private_key = normalize_credential_path(ssh_private_key_path);
+	bool dirty = false;
+	bool used_stored_passphrase = false;
+	bool used_stored_password = false;
+
+	if (password.is_empty()) {
+		if (!stored_password.is_empty()) {
+			creds.password = stored_password;
+			used_stored_password = true;
+		}
+	} else if (password != stored_password) {
+		stored_password = password;
+		dirty = true;
+	}
+
+	if (ssh_passphrase.is_empty()) {
+		if (!private_key.is_empty() && stored_passphrases.has(private_key)) {
+			creds.ssh_passphrase = stored_passphrases[private_key];
+			used_stored_passphrase = true;
+		}
+	} else if (!private_key.is_empty()) {
+		if (!stored_passphrases.has(private_key) || String(stored_passphrases[private_key]) != ssh_passphrase) {
+			stored_passphrases[private_key] = ssh_passphrase;
+			dirty = true;
+		}
+	}
+	// private_key 为空时口令无处归档，只在本次会话内有效（不写盘）。
+
+	if (dirty) {
+		_persist_secrets();
+	}
+
+	// 兜底必须留痕：否则"对话框密码栏是空的、却认证成功了"这件事在日志里毫无
+	// 痕迹，下次出问题又要从"为什么这次能成"重新猜起。
+	if (used_stored_passphrase) {
+		print_line("Git: the SSH passphrase field is empty; using the passphrase this module saved for private key \"",
+				private_key, "\". Type a new passphrase in the dialog and press Apply to replace it, or delete \"",
+				_secrets_file_path(), "\" to forget it.");
+	}
+	if (used_stored_password) {
+		print_line("Git: the password field is empty; using the password/token this module saved. "
+				   "Type a new one in the dialog and press Apply to replace it.");
+	}
 }
 
 void Git::_discard_file(const String &file_path) {
@@ -732,6 +867,8 @@ void Git::_run_network_job(const BgJob &p_job, git_repository *p_repo) {
 	// libgit2 的 credentials 回调 payload 需要非 const 指针，这里取一份可变副本，
 	// 生命周期覆盖整个网络操作期间。改名 job_creds 以免遮蔽类成员 creds。
 	Credentials job_creds = p_job.creds_copy;
+	// 每次任务重置认证计数：一次连接只允许回调给出一套凭据，见 credentials_cb。
+	job_creds.auth_attempt = 0;
 	switch (p_job.type) {
 		case JOB_PUSH: {
 			_push_impl(p_repo, job_creds, p_job.remote, p_job.force);
@@ -744,6 +881,112 @@ void Git::_run_network_job(const BgJob &p_job, git_repository *p_repo) {
 		} break;
 		default:
 			break;
+	}
+}
+
+// 传输层代理选项的唯一来源。三个 _*_impl 的 connect 与 fetch/push options 都必须取自它：
+// 少一处，代理就会在那一处被丢弃。libgit2 的两段机制决定了这一点：
+//   1) git_remote_fetch / git_remote_push 内部都走 connect_or_reset_options()，传输层已连接时会
+//      用「由 fetch/push options 派生」的参数覆盖已存的 connect_opts
+//      （remote.c: connect_or_reset_options → smart.c: git_smart__set_connect_opts
+//       → git_remote_connect_options_normalize）；
+//   2) http 传输是每个请求都重新判决代理（http.c: lookup_proxy 读 transport->owner->connect_opts）。
+//
+// 取 GIT_PROXY_AUTO 而非 NONE / SPECIFIED：AUTO 让 libgit2 按 git CLI 的同一套规则解析
+// remote.<name>.proxy → http.<url>.proxy → http.proxy → HTTPS_PROXY / no_proxy
+// （remote.c: git_remote__http_proxy），用户换代理不必改本模块。https 目标会走 CONNECT 隧道
+// （httpclient.c: use_connect_proxy 要求 scheme 为 https 且配有代理主机），故 HTTPS 远端同样可达。
+// ssh 传输不读取 proxy_opts（ssh*.c 内无 proxy 引用），填了也不会影响 SSH 远端。
+git_proxy_options Git::_proxy_options() {
+	git_proxy_options opts = GIT_PROXY_OPTIONS_INIT;
+	opts.type = GIT_PROXY_AUTO;
+	return opts;
+}
+
+// 连接失败时的归类提示。
+//
+// 这里原本是一句无条件的 "Are your credentials correct? Try using a PAT token
+// (in case you are using Github) as your password"。当真实原因是网络不可达时，
+// 这句话是纯粹的误导：本项目实际踩过——本机直连 github.com:443 超时，提示却把
+// 排查方向引向凭据/token，绕了一大圈。libgit2 的真实错误始终由紧随其后的
+// check_errors() 原样打印，本函数只负责归类并给出相应的排查方向。
+//
+// GIT_EAUTH(-16) 是 libgit2 专为「远端拒绝认证」定义的返回码（errors.h:52），
+// 与网络/传输失败严格区分，故优先按它判断；其余情况按 git_error_last()->klass
+// 分派（错误类别由 libgit2 在出错现场设置，比包装文案可靠）。
+//
+// GIT_EAUTH 的成因已用 tools/ssh2-trace-probe 实测定案（同一把密钥、同一台
+// ssh.github.com:443，每次只改一个变量）：
+//
+//   私钥口令         libssh2 返回               libgit2 返回     模块最终报出
+//   ------------------------------------------------------------------------------
+//   正确             0                          成功             —
+//   错 / 空          -19 PUBLICKEY_UNVERIFIED   -16 GIT_EAUTH    authentication failed: ...
+//   密钥文件不存在   -16 LIBSSH2_ERROR_FILE     -1               failed to authenticate SSH session
+//
+// 即：**加密私钥的口令为空或填错，就是 -16**。链路是：OpenSSH 格式私钥的公钥部分
+// 是明文，libssh2 不需要口令就能读出来，于是请求照样发到服务器并拿到 PK_OK；等到
+// 真正要用私钥签名时（userauth.c:1748 的 sign_callback）才解不开，报
+// PUBLICKEY_UNVERIFIED——这条路径的文案是 "Callback returned error"（1.11.1 里依旧
+// 如此），听着像调用方写错了代码（已在本模块捆绑的 libssh2 里改写为与口令相关的说明）。
+// 而 ssh_libssh2.c:374 把 -19 与「服务器拒绝公钥」一起映射成 GIT_EAUTH，两者在那一层
+// 不可区分。注意别把这里的 -16 与 LIBSSH2_ERROR_FILE 的 -16 混为一谈，那是两个库
+// 各自的编号。
+//
+// 曾经把这归因于「GitHub 拒绝 SHA-1(ssh-rsa) 签名」或「RSA 需要 rsa-sha2-* 协商」，
+// 已实测推翻，不要重蹈：让 OpenSSH 强制以 SHA-1 签名（ssh -o PubkeyAcceptedAlgorithms=
+// ssh-rsa -T git@github.com）认证照样成功；探针用同一把 id_rsa 直接调
+// libssh2_userauth_publickey_fromfile 也是 rc=0。升级 libssh2 到 1.11.1 与这个
+// 问题无关：1.11.1 在 userauth.c 上只动了三处（分配失败分支的判断修正、
+// privkey_file/privkey_mem 命名纠正、新增 rsa-sha2-*_cert 证书算法支持），
+// 非证书路径的签名算法选择逻辑没有变。
+//
+// 文案层面也曾更糟：libgit2 认证被拒后会拿同一份凭据反复重试（ssh_libssh2.c 的
+// while (error == GIT_EAUTH) 循环），直到服务器掐断连接，最后停在 list_auth_methods()
+// 上，于是表面文案变成 "remote rejected authentication: Failed getting response"，
+// 看着像连不上。现已在**模块侧**堵住：credentials_cb 第二次被问到时返回 GIT_EUSER
+// 终止重试（git_callbacks.cpp），并在 libgit2 没留下失败原因时自己补一条 ——
+// 于是错误码从 GIT_EAUTH(-16) 变成 GIT_EUSER(-7)，文案由本函数给。
+//
+// 子模块那几处属**可选增强**，不改也完整成立（错误码与可读文案都不缺，见上）：
+//   libgit2/…/ssh_libssh2.c  返回 GIT_EAUTH 前用 libssh2 原话记一笔；刷新认证方法
+//                            失败时不覆盖该原因。不改则由上面那条模块侧兜底代劳。
+//   libssh2/src/userauth.c   "Callback returned error" 改为说明口令/密钥的文案。
+//                            不改则那条 libssh2 原话仍是旧措辞。
+//   libssh2/src/session.c    按 LIBSSH2_TRACE 环境变量打开 trace（纯诊断）。
+// 之所以可省：引擎链接的是 bin/thirdparty 下的预编译 .lib，子模块源码根本不参与
+// 构建（见 SCsub），改了不重编 .lib 就不生效；而不重编 .lib 也照样能编引擎。
+String Git::_connect_failure_hint(int p_error) {
+	// GIT_EUSER(-7)：credentials_cb 主动终止重试后 libgit2 原样传出的码
+	// （callback 返回负值 -> ssh_libssh2.c 的 while (error == GIT_EAUTH) 循环不成立
+	// -> goto done）。凡是走到这里，都意味着「同一份凭据被给了第二次」，也就是
+	// 首次凭据确已被拒——只是 libgit2 把本地签名失败（口令错/空）与服务器拒绝
+	// 公钥归成了同一个 GIT_EAUTH，光看码分不出来，所以文案要同时覆盖两者。
+	if (p_error == GIT_EUSER) {
+		return "The credentials were rejected, so the retry was stopped early. For an SSH key only the private key path is required - the public key path may be left empty, in which case the public key is derived from the private key file. With an encrypted private key an empty or wrong passphrase is the most common cause. Also check that the public key is registered on the remote and that the paths carry no surrounding quotes or spaces.";
+	}
+
+	if (p_error == GIT_EAUTH) {
+		// 只有私钥路径是必需的：公钥路径留空时 libssh2 会从私钥现算公钥
+		// （userauth.c:1992-2006 的 if(publickey) 分支）。所以提示先讲这一条，
+		// 免得用户以为公钥没填/填错才失败，而去折腾密钥本身。
+		return "Authentication was rejected by the remote. For an SSH key only the private key path is required - the public key path may be left empty, in which case the public key is derived from the private key file. With an encrypted private key, an empty or wrong passphrase is refused locally by libssh2 and reported here as a rejected authentication. Also check that the public key is registered on the remote and that the paths carry no surrounding quotes or spaces. Over HTTPS, GitHub requires a personal access token (PAT) rather than the account password.";
+	}
+
+	const git_error *lg2err = git_error_last();
+	switch (lg2err != nullptr ? lg2err->klass : (int)GIT_ERROR_NONE) {
+		case GIT_ERROR_NET:
+			return "The remote could not be reached over the network. Check the connection, and if a proxy is required configure it for git (remote.<name>.proxy / http.<url>.proxy / http.proxy / HTTPS_PROXY).";
+		case GIT_ERROR_SSL:
+			return "TLS negotiation with the remote failed. Check the proxy settings and any TLS-inspecting software on the network path.";
+		case GIT_ERROR_HTTP:
+			return "The remote rejected the HTTPS request. Over HTTPS, GitHub requires a personal access token (PAT) rather than the account password.";
+		case GIT_ERROR_SSH:
+			return "The SSH transport failed. Only the private key path is required - the public key path may be left empty, in which case the public key is derived from the private key file. Check the key path and its passphrase in the local settings dialog (an encrypted private key is rejected when its passphrase is empty or wrong - the key never gets as far as the remote), that the host key is present in your known_hosts file, and that the public key is registered on the remote.";
+		case GIT_ERROR_CALLBACK:
+			return "A callback refused to continue. Check the credentials entered in the local settings dialog.";
+		default:
+			return "See the libgit2 error printed with this message for the underlying cause.";
 	}
 }
 
@@ -762,10 +1005,17 @@ void Git::_fetch_impl(git_repository *p_repo, Credentials &p_creds, const String
 	remote_cbs.push_transfer_progress = &push_transfer_progress_cb;
 	remote_cbs.push_update_reference = &push_update_reference_cb;
 
-	GIT2_CALL(git_remote_connect(remote_object.get(), GIT_DIRECTION_FETCH, &remote_cbs, nullptr, nullptr), "Could not connect to remote \"" + p_remote + "\". Are your credentials correct? Try using a PAT token (in case you are using Github) as your password");
+	const git_proxy_options proxy_opts = _proxy_options();
+
+	// 拆成两步而不是写成 GIT2_CALL 的单行：C++ 未规定函数实参的求值顺序，
+	// 若把 git_remote_connect 直接写在第一个参数位置，MSVC 会先算 message，
+	// 于是 _connect_failure_hint 读到的是上一次的错误而非本次的。
+	const int connect_error = git_remote_connect(remote_object.get(), GIT_DIRECTION_FETCH, &remote_cbs, &proxy_opts, nullptr);
+	GIT2_CALL(connect_error, "Could not connect to remote \"" + p_remote + "\". " + _connect_failure_hint(connect_error));
 
 	git_fetch_options opts = GIT_FETCH_OPTIONS_INIT;
 	opts.callbacks = remote_cbs;
+	opts.proxy_opts = proxy_opts;
 	GIT2_CALL(git_remote_fetch(remote_object.get(), nullptr, &opts, "fetch"), "Could not fetch data from remote");
 
 	print_line("Git: Fetch ended");
@@ -786,10 +1036,15 @@ void Git::_pull_impl(git_repository *p_repo, Credentials &p_creds, const String 
 	remote_cbs.push_transfer_progress = &push_transfer_progress_cb;
 	remote_cbs.push_update_reference = &push_update_reference_cb;
 
-	GIT2_CALL(git_remote_connect(remote_object.get(), GIT_DIRECTION_FETCH, &remote_cbs, nullptr, nullptr), "Could not connect to remote \"" + p_remote + "\". Are your credentials correct? Try using a PAT token (in case you are using Github) as your password");
+	const git_proxy_options proxy_opts = _proxy_options();
+
+	// 拆成两步，原因同 _fetch_impl 中的注释（实参求值顺序）。
+	const int connect_error = git_remote_connect(remote_object.get(), GIT_DIRECTION_FETCH, &remote_cbs, &proxy_opts, nullptr);
+	GIT2_CALL(connect_error, "Could not connect to remote \"" + p_remote + "\". " + _connect_failure_hint(connect_error));
 
 	git_fetch_options fetch_opts = GIT_FETCH_OPTIONS_INIT;
 	fetch_opts.callbacks = remote_cbs;
+	fetch_opts.proxy_opts = proxy_opts;
 
 	String branch_name = _current_branch_name_with(p_repo);
 
@@ -888,8 +1143,11 @@ void Git::_push_impl(git_repository *p_repo, Credentials &p_creds, const String 
 	remote_cbs.push_transfer_progress = &push_transfer_progress_cb;
 	remote_cbs.push_update_reference = &push_update_reference_cb;
 
-	String msg = "Could not connect to remote \"" + p_remote + "\". Are your credentials correct? Try using a PAT token (in case you are using Github) as your password";
-	GIT2_CALL(git_remote_connect(remote_object.get(), GIT_DIRECTION_PUSH, &remote_cbs, nullptr, nullptr), msg);
+	const git_proxy_options proxy_opts = _proxy_options();
+
+	// 拆成两步，原因同 _fetch_impl 中的注释（实参求值顺序）。
+	const int connect_error = git_remote_connect(remote_object.get(), GIT_DIRECTION_PUSH, &remote_cbs, &proxy_opts, nullptr);
+	GIT2_CALL(connect_error, "Could not connect to remote \"" + p_remote + "\". " + _connect_failure_hint(connect_error));
 
 	String branch_name = _current_branch_name_with(p_repo);
 
@@ -898,6 +1156,7 @@ void Git::_push_impl(git_repository *p_repo, Credentials &p_creds, const String 
 
 	git_push_options push_options = GIT_PUSH_OPTIONS_INIT;
 	push_options.callbacks = remote_cbs;
+	push_options.proxy_opts = proxy_opts;
 
 	GIT2_CALL(git_remote_push(remote_object.get(), &refspec, &push_options), "Failed to push");
 

@@ -11,6 +11,7 @@
 
 #include "core/os/thread.h"
 #include "core/templates/hash_map.h"
+#include "core/variant/dictionary.h"
 #include "editor/version_control/editor_vcs_interface.h"
 #include "git2.h"
 
@@ -20,6 +21,13 @@ struct Credentials {
 	String ssh_public_key_path;
 	String ssh_private_key_path;
 	String ssh_passphrase;
+
+	// 本次网络连接里 credentials 回调被调用的次数。每次 _run_network_job 开始时清零
+	// （凭据以副本形式投递给后台线程，计数器不跨任务残留）。
+	// 用途：libgit2 在认证被拒后会拿同一份凭据反复回问，直到服务器掐断连接
+	// （ssh_libssh2.c 的 while (error == GIT_EAUTH) 循环）。本模块一次连接只有一套
+	// 凭据，靠它判断"已经给过并被拒"，从而主动终止重试。详见 git_callbacks.cpp。
+	int auth_attempt = 0;
 };
 
 class Git : public EditorVCSInterface {
@@ -76,6 +84,28 @@ public:
 
 private:
 	void _attach_bridge_script();
+
+	// —— 口令持久化 ——
+	//
+	// 引擎的「本地设置」对话框只回填 username 与两个密钥路径，且只把这三项写进
+	// EditorSettings（sources_stable/godot-4.7.2-stable/editor/version_control/
+	// version_control_editor_plugin.cpp:186-188）。Password 与 SSH Passphrase 两栏
+	// 既不保存也不回填，对话框每次重建都是空的；而插件在 NOTIFICATION_READY 里
+	// 紧接着就用这套空值调一次 set_credentials（同文件 :78），于是重启编辑器后
+	// 送到 libgit2 的口令就是空字符串——加密私钥在本地签名阶段解不开，libgit2 报
+	// GIT_EAUTH(-16)。本模块自己把这两项存下来，补齐被引擎漏掉的那一半凭据。
+	//
+	// 存放位置见 _secrets_file_path()。明文落盘是已知取舍：ConfigFile 只提供基于
+	// 口令的加密，而"保管这个口令的口令"本身无处可放，加密只是把问题挪一层。
+	// 文件位于编辑器配置目录，与引擎已存的 username/密钥路径同级、同权限保护。
+	//
+	// 口令按私钥路径归档：口令是"这把私钥的"属性，换密钥不该串用。
+	Dictionary stored_passphrases; // 私钥路径（已规范化）-> 口令
+	String stored_password;        // HTTPS 密码 / PAT
+	bool secrets_loaded = false;   // 惰性加载，每次实例化只读一次盘
+	static String _secrets_file_path();
+	void _load_persisted_secrets();
+	void _persist_secrets();
 
 	// —— 线程化改造：状态快照缓存 / diff 预计算 / 网络操作后台化 ——
 	//
@@ -146,4 +176,13 @@ private:
 	void _fetch_impl(git_repository *p_repo, Credentials &p_creds, const String &p_remote);
 	void _pull_impl(git_repository *p_repo, Credentials &p_creds, const String &p_remote);
 	void _push_impl(git_repository *p_repo, Credentials &p_creds, const String &p_remote, bool p_force);
+
+	// 传输层代理选项的唯一来源：三个 _*_impl 的 connect 与 fetch/push options
+	// 都必须取自它，详见 git.cpp 中的实现注释。
+	static git_proxy_options _proxy_options();
+
+	// 连接失败时的归类提示：按 GIT_EUSER（回调主动终止重试，见 git_callbacks.cpp 的
+	// credentials_cb）、GIT_EAUTH、以及 git_error_last()->klass 分派，避免把网络层故障
+	// 一律说成「凭据错误」。详见 git.cpp 中的实现注释。
+	static String _connect_failure_hint(int p_error);
 };

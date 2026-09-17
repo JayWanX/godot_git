@@ -26,8 +26,8 @@ build_thirdparty.py —— 构建 godot_git 模块所链接的三个第三方静
     顺序是有依赖的：OpenSSL -> libssh2 -> libgit2。只编单个目标时，
     它前面的产物必须已经存在。
 
-    两个逃生口：--clean 删掉构建目录从头来，--reconfigure 强制重跑
-    OpenSSL 的配置（正常情况下配置没变就不会重跑，见"增量"一节）。
+    两个逃生口：--clean 删掉构建目录从头来（只删本次 target 的），--reconfigure
+    强制重跑 OpenSSL 的配置（正常情况下配置没变就不会重跑，见"增量"一节）。
 
 前置条件
     - 三个子模块的源码可用。哪个缺了就自动补哪个：
@@ -798,7 +798,8 @@ def _libssh2_from_cache(ctx, expected):
 # 各话：宁可多配一次，也不会漏配。（代价是 git checkout 回到同样的内容也会重配
 # 一次，这是"保守但正确"的方向。）
 #
-# 逃生口：--reconfigure 无条件重跑配置；--clean 删掉整个构建目录，自然也重配。
+# 逃生口：--reconfigure 无条件重跑配置；--clean 删掉构建目录（只删本次目标的，
+# 见 clean()），自然也重配。
 # ==============================================================================
 
 # 上次 Configure 的参数记在 configdata.pm 的 %config{perlargv} 里
@@ -1042,8 +1043,21 @@ def build_libssh2(ctx):
         str(SSH2_SRC),
     ]
     if ctx.is_windows:
-        # 与引擎一致，静态 CRT（/MT）
-        cmd.insert(3, "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded")
+        # 与引擎一致，静态 CRT（/MT）。
+        #
+        # 只给 CMAKE_MSVC_RUNTIME_LIBRARY 是**不够**的：libssh2 的 CMakeLists 声明的是
+        # cmake_minimum_required(VERSION 3.1)，按该声明策略 CMP0091 默认是 OLD，
+        # 而 OLD 下 CMAKE_MSVC_RUNTIME_LIBRARY 被**静默忽略** —— 实际仍走 CMake 的
+        # MSVC 默认 /MD（实测 flags.make 里 C_FLAGS 就是 `/MD`）。后果是链接引擎时
+        # LNK4098（msvcrt.lib 与其他库冲突）+ libssh2 每个 obj 各一条 LNK4286
+        # （把 UCRT 当 dllimport），libssh2 与引擎/libgit2/OpenSSL 各用一套 CRT 堆。
+        # CMAKE_POLICY_DEFAULT_CMP0091=NEW 把该策略的默认值改成 NEW，变量才生效
+        # （实测 C_FLAGS 由 `/MD` 变为 `-MT`）。libgit2 不需要这个：它有自己的
+        # STATIC_CRT 选项且默认 ON，本来就是 /MT。
+        cmd[3:3] = [
+            "-DCMAKE_POLICY_DEFAULT_CMP0091=NEW",
+            "-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded",
+        ]
     else:
         # 静态库要被链进可执行文件，也可能被链进 Godot 的 shared_library 构建，
         # 位置无关代码两种情况都成立。
@@ -1124,12 +1138,19 @@ ORDER = ("openssl", "libssh2", "libgit2")
 # ==============================================================================
 
 
-def clean(ctx):
-    for name, path in (
-        ("openssl", ctx.openssl_bld),
-        ("libssh2", ctx.ssh2_bld),
-        ("libgit2", ctx.git2_bld),
-    ):
+def clean(ctx, targets):
+    """删除**本次要构建的目标**的构建目录。
+
+    语义按 target 走：`--clean libssh2` 只清 libssh2，不会连带删掉 OpenSSL 那个
+    十分钟量级的构建目录（清掉就意味着 OpenSSL 从头重编）。
+    """
+    dirs = {
+        "openssl": ctx.openssl_bld,
+        "libssh2": ctx.ssh2_bld,
+        "libgit2": ctx.git2_bld,
+    }
+    for name in targets:
+        path = dirs[name]
         if path.exists():
             log("  removing %s" % path)
             shutil.rmtree(path, ignore_errors=True)
@@ -1158,7 +1179,8 @@ def parse_args(argv):
             "  python build_thirdparty.py\n"
             "  python build_thirdparty.py libgit2\n"
             "  python build_thirdparty.py              # 重复运行只做增量，秒级\n"
-            "  python build_thirdparty.py --clean all          # 清掉重来\n"
+            "  python build_thirdparty.py --clean all          # 三个都清掉重来（20–40 分钟）\n"
+            "  python build_thirdparty.py --clean libssh2      # 只清 libssh2，不碰 OpenSSL 的产物\n"
             "  python build_thirdparty.py --reconfigure all    # 强制重跑 OpenSSL 配置\n"
             "  python build_thirdparty.py --depth 1 all    # 首次拉源码走浅克隆\n"
             "  CMAKE=/path/to/cmake/bin/cmake python build_thirdparty.py\n"
@@ -1195,7 +1217,11 @@ def parse_args(argv):
             "之后无法 checkout 任意 tag（例如把 libssh2 对齐到 1.11.1）"
         ),
     )
-    parser.add_argument("--clean", action="store_true", help="构建前删除本平台的构建目录")
+    parser.add_argument(
+        "--clean",
+        action="store_true",
+        help="构建前删除构建目录；只删本次 target 的（--clean libssh2 不碰 OpenSSL）",
+    )
     parser.add_argument(
         "--reconfigure",
         action="store_true",
@@ -1232,7 +1258,7 @@ def main(argv):
     check_sources(ctx, selected)
     if args.clean:
         log("cleaning build directories:")
-        clean(ctx)
+        clean(ctx, selected)
         log("")
     resolve_tools(ctx)
 

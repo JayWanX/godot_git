@@ -191,18 +191,20 @@ private:
 // ---------------------------------------------------------------------------
 // 模块日志的统一出口
 //
-// 背景：libgit2 的传输回调（git_callbacks.cpp 的 update_cb / progress_cb 等）
-// 在后台线程里被调用，而引擎的 print_line 会经 IO 管线派发到编辑器日志面板；
-// 面板刷新与线程切换之间存在竞态，实测能观察到「同一批回调里最后一行丢失」
-// （远端已更新、remote-tracking ref 也已写入，唯独对应的那行没出现）。
+// 背景一（格式）：libgit2 的传输回调（git_callbacks.cpp 的 update_cb /
+// progress_cb 等）在后台线程里被调用，而引擎的 print_line 会经 IO 管线派发到
+// 编辑器日志面板；面板刷新与线程切换之间存在竞态，实测能观察到「同一批回调里
+// 最后一行丢失」（远端已更新、remote-tracking ref 也已写入，唯独对应的那行
+// 没出现）。这里不解决引擎内部的竞态（也做不到：面板不经过 stdout，
+// fflush(stdout) 对它无效，根因在 MessageQueue::push_callablep 页满丢消息）。
 //
-// 这里不解决引擎内部的竞态（也做不到：面板不经过 stdout，fflush(stdout)
-// 对它无效），只做两件确定有效的事：
-//   1. 统一格式 —— 所有模块日志经此出口，前缀与语言一致，便于搜与读；
-//   2. 输出后 fflush —— 日志被重定向到文件/管道时（-v 启动、CI、用户自查），
-//      保证内容在进程被强杀前已经落到真实 stdout。
+// 背景二（**语言必须用 ASCII/English**）：Godot 在 Windows 上把日志字符串按
+// UTF-8 取出后，经 OS::print() -> Logger::logv() -> WriteFile() 原样写进控制台，
+// 全程不做代码页转换（windows_terminal_logger.cpp:39-64）。中文 Windows 的
+// 控制台代码页是 936(GBK)，把 UTF-8 字节按 GBK 解释就是乱码。编辑器面板显示
+// 正常，控制台那一路必然乱码。所以：注释可以写中文，**运行时字符串只能是 ASCII**。
 //
-// 用法：日志一律写成 git_log("push: 已完成"); 不要直接调 print_line。
+// 用法：日志一律写成 git_log("[push] starting"); 不要直接调 print_line。
 // 需要错误/警告级别时用 git_log_error() / git_log_warn()。
 void git_log(const String &p_message);
 void git_log_error(const String &p_message);

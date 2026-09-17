@@ -4,6 +4,12 @@
 #include "git_callbacks.h"
 #include "git.h"
 
+// libgit2 1.9 起，错误信息的 setter 从公开的 git2/errors.h 移到了 git2/sys/errors.h
+// （归入 "advanced error handling"，面向 callback 与自定义后端这类调用方），
+// errors.h 只剩 git_error_last()。顶层 git2.h 不包含 sys/ 下的头，必须显式引入，
+// 否则本文件里补错误文案那句 git_error_set_str() 会报 C3861 找不到标识符。
+#include <git2/sys/errors.h>
+
 #include "core/variant/variant_utility.h"
 
 extern "C" int progress_cb(const char *str, int len, void *data) {

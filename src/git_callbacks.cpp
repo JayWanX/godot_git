@@ -1,4 +1,4 @@
-#include <iostream>
+#include <cstdio>
 #include <cstring>
 
 #include "git_callbacks.h"
@@ -15,7 +15,8 @@
 extern "C" int progress_cb(const char *str, int len, void *data) {
 	(void)data;
 
-	print_line("remote: ", String::utf8(str, len).strip_edges());
+	// 远端 sideband 通道的原样文本（"remote: ..."），前缀由 git_log 统一补。
+	git_log("[remote] " + String::utf8(str, len).strip_edges());
 
 	return 0;
 }
@@ -28,10 +29,10 @@ extern "C" int update_cb(const char *refname, const git_oid *a, const git_oid *b
 
 	git_oid_tostr(b_str, short_commit_length, b);
 	if (git_oid_is_zero(a)) {
-		print_line("* [new] ", String::utf8(b_str), " ", String::utf8(refname));
+		git_log(vformat("[ref] 新建 %s %s", String::utf8(refname), String::utf8(b_str)));
 	} else {
 		git_oid_tostr(a_str, short_commit_length, a);
-		print_line("[updated] ", String::utf8(a_str), "...", String::utf8(b_str), " ", String::utf8(refname));
+		git_log(vformat("[ref] 更新 %s %s...%s", String::utf8(refname), String::utf8(a_str), String::utf8(b_str)));
 	}
 
 	return 0;
@@ -41,11 +42,11 @@ extern "C" int transfer_progress_cb(const git_indexer_progress *stats, void *pay
 	(void)payload;
 
 	if (stats->received_objects == stats->total_objects) {
-		print_line("Resolving deltas ", uint32_t(stats->indexed_deltas), "/", uint32_t(stats->total_deltas));
+		git_log(vformat("[recv] 解压增量 %d/%d", uint32_t(stats->indexed_deltas), uint32_t(stats->total_deltas)));
 	} else if (stats->total_objects > 0) {
-		print_line(
-				"Received ", uint32_t(stats->received_objects), "/", uint32_t(stats->total_objects),
-				" objects (", uint32_t(stats->indexed_objects), ") in ", uint32_t(stats->received_bytes), " bytes");
+		git_log(vformat("[recv] 对象 %d/%d（已索引 %d），已接收 %d 字节",
+				uint32_t(stats->received_objects), uint32_t(stats->total_objects),
+				uint32_t(stats->indexed_objects), uint32_t(stats->received_bytes)));
 	}
 	return 0;
 }
@@ -64,16 +65,16 @@ extern "C" int push_transfer_progress_cb(unsigned int current, unsigned int tota
 		progress = (current * 100) / total;
 	}
 
-	print_line("Writing Objects: ", uint32_t(progress), "% (", uint32_t(current), "/", uint32_t(total), ", ", uint32_t(bytes), " bytes done.)");
+	git_log(vformat("[push] 写入对象 %d%%（%d/%d，%d 字节）",
+			uint32_t(progress), uint32_t(current), uint32_t(total), uint32_t(bytes)));
 	return 0;
 }
 
 extern "C" int push_update_reference_cb(const char *refname, const char *status, void *data) {
 	if (status != NULL) {
-		String status_str = String::utf8(status);
-		print_line("[rejected] ", String::utf8(refname), " ", status_str);
+		git_log(vformat("[push] 被远端拒绝 %s：%s", String::utf8(refname), String::utf8(status)));
 	} else {
-		print_line("[updated] ", String::utf8(refname));
+		git_log(vformat("[push] 已更新 %s", String::utf8(refname)));
 	}
 	return 0;
 }
@@ -148,10 +149,11 @@ extern "C" int credentials_cb(git_cred **out, const char *url, const char *usern
 		if (allowed_types & GIT_CREDENTIAL_SSH_KEY) {
 			// 配置排错用：把实际交给 libgit2 的参数记进日志。路径填错、口令漏填
 			// 原本在日志里没有任何痕迹，只能逐个字段去猜。口令只报有无，不打印内容。
-			print_line("Git: using SSH key credentials (user=\"", proper_username,
-					"\", publickey=\"", ssh_public_key.is_empty() ? "(none, derived from private key)" : ssh_public_key,
-					"\", privatekey=\"", ssh_private_key,
-					"\", passphrase=", creds->ssh_passphrase.is_empty() ? "(empty)" : "(provided)", ")");
+			git_log(vformat("凭据：使用 SSH 密钥（user=\"%s\", publickey=\"%s\", privatekey=\"%s\", passphrase=%s）",
+					proper_username,
+					ssh_public_key.is_empty() ? "(未填，由私钥现算)" : ssh_public_key,
+					ssh_private_key,
+					creds->ssh_passphrase.is_empty() ? "(空)" : "(已提供)"));
 			return git_credential_ssh_key_new(out,
 					CString(proper_username).data,
 					ssh_public_key.is_empty() ? nullptr : CString(ssh_public_key).data,
@@ -161,8 +163,8 @@ extern "C" int credentials_cb(git_cred **out, const char *url, const char *usern
 	}
 
 	if (allowed_types & GIT_CREDENTIAL_USERPASS_PLAINTEXT) {
-		print_line("Git: using username/password credentials (user=\"", proper_username,
-				"\", password=", creds->password.is_empty() ? "(empty)" : "(provided)", ")");
+		git_log(vformat("凭据：使用用户名/密码（user=\"%s\", password=%s）",
+				proper_username, creds->password.is_empty() ? "(空)" : "(已提供)"));
 		return git_cred_userpass_plaintext_new(out, CString(proper_username).data, CString(creds->password).data);
 	}
 

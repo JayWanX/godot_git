@@ -1,6 +1,7 @@
 #include "git.h"
 
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 
 #include <git2/tree.h>
@@ -47,6 +48,31 @@
 	}
 
 #define COMMA ,
+
+// ---------------------------------------------------------------------------
+// 模块日志的统一出口（声明与设计说明见 git.h）
+//
+// 统一格式：与 git CLI 的对齐感来自"分区 + 内容"两段式，而不是零散前缀。
+//   普通进度   Git: [push] 开始推送到 "origin"
+//   成功结果   Git: [push] 完成
+//   警告       Git: [warn] ...
+//   错误       Git: [error] ...
+// fflush 只对真实 stdout 有效（编辑器日志面板走引擎 IO 管线，不经过 stdout），
+// 它保的是"重定向到文件/管道时不被进程退出吃掉"这一场景。
+void git_log(const String &p_message) {
+	print_line("Git: ", p_message);
+	fflush(stdout);
+}
+
+void git_log_error(const String &p_message) {
+	ERR_PRINT("Git: [error] " + p_message);
+	fflush(stdout);
+}
+
+void git_log_warn(const String &p_message) {
+	WARN_PRINT("Git: [warn] " + p_message);
+	fflush(stdout);
+}
 
 // ------------------------------------------------------------------
 // 桥接脚本：EditorVCSInterface 的 25 个回调是 GDVIRTUAL（只认脚本与
@@ -154,11 +180,11 @@ void Git::_attach_bridge_script() {
 	bridge->set_source_code(String::utf8(GIT_BRIDGE_SCRIPT));
 	Error err = bridge->reload();
 	if (err != OK) {
-		ERR_PRINT(vformat("Git: bridge script failed to compile (error %d), VCS integration will not work.", (int)err));
+		git_log_error(vformat("初始化：桥接脚本编译失败（错误码 %d），VCS 功能本次不可用。", (int)err));
 	}
 	set_script(bridge);
 #else
-	ERR_PRINT_ONCE("Git: GDScript module is required for the VCS bridge.");
+	ERR_PRINT_ONCE("Git: [error] 初始化：需要 GDScript 模块才能建立 VCS 桥接。");
 #endif
 }
 
@@ -226,7 +252,7 @@ bool Git::check_errors(int error, String function, String file, int line, String
 		message = message + String::utf8(lg2err->message);
 	}
 
-	ERR_PRINT(vformat("Git: %s in %s:%s#L%d", message, file, function, line));
+	ERR_PRINT(vformat("Git: [error] %s（%s:%s 第 %d 行）", message, file, function, line));
 	return true;
 }
 
@@ -288,7 +314,7 @@ void Git::_persist_secrets() {
 	if (!DirAccess::dir_exists_absolute(dir)) {
 		const Error err = DirAccess::make_dir_recursive_absolute(dir);
 		if (err != OK) {
-			ERR_PRINT(vformat("Git: 无法创建凭据目录 \"%s\"（错误码 %d），SSH 口令与 HTTPS 密码将不会被记住。", dir, (int)err));
+			git_log_error(vformat("凭据：无法创建目录 \"%s\"（错误码 %d），SSH 口令与 HTTPS 密码本次会话内仍可用，但不会被记住。", dir, (int)err));
 			return;
 		}
 	}
@@ -300,7 +326,7 @@ void Git::_persist_secrets() {
 
 	const Error err = cfg.save(path);
 	if (err != OK) {
-		ERR_PRINT(vformat("Git: 无法写入凭据文件 \"%s\"（错误码 %d），SSH 口令与 HTTPS 密码将不会被记住。", path, (int)err));
+		git_log_error(vformat("凭据：无法写入文件 \"%s\"（错误码 %d），SSH 口令与 HTTPS 密码本次会话内仍可用，但不会被记住。", path, (int)err));
 		// 不改变内存中的值：本次会话仍然可用，只是下次启动要重填。
 		// 此处不引入新的失败语义——持久化只是便利，不该让网络操作失败。
 	}
@@ -361,13 +387,12 @@ void Git::_set_credentials(const String &username, const String &password, const
 	// 兜底必须留痕：否则"对话框密码栏是空的、却认证成功了"这件事在日志里毫无
 	// 痕迹，下次出问题又要从"为什么这次能成"重新猜起。
 	if (used_stored_passphrase) {
-		print_line("Git: the SSH passphrase field is empty; using the passphrase this module saved for private key \"",
-				private_key, "\". Type a new passphrase in the dialog and press Apply to replace it, or delete \"",
-				_secrets_file_path(), "\" to forget it.");
+		git_log(vformat("凭据：口令栏为空，沿用本模块为私钥 \"%s\" 保存的口令。"
+				"要更换请在对话框里填入新口令并点应用；要清除请删除 \"%s\"。",
+				private_key, _secrets_file_path()));
 	}
 	if (used_stored_password) {
-		print_line("Git: the password field is empty; using the password/token this module saved. "
-				   "Type a new one in the dialog and press Apply to replace it.");
+		git_log("凭据：密码栏为空，沿用本模块保存的密码/令牌。要更换请在对话框里填入新值并点应用。");
 	}
 }
 
@@ -891,7 +916,7 @@ void Git::_post_job(int p_type, const String &p_remote, bool p_force) {
 		}
 	}
 	if (busy) {
-		ERR_PRINT("Git: 上一个网络任务尚未结束，已忽略本次请求（" + p_remote + "）。");
+		git_log_error("网络：上一个任务尚未结束，已忽略本次 " + p_remote + " 的请求。");
 		return;
 	}
 	bg_cv.notify_all();
@@ -1032,7 +1057,7 @@ String Git::_connect_failure_hint(int p_error) {
 }
 
 void Git::_fetch_impl(git_repository *p_repo, Credentials &p_creds, const String &p_remote) {
-	print_line("Git: Performing fetch from ", p_remote);
+	git_log(vformat("[fetch] 开始，远端 \"%s\"", p_remote));
 
 	git_remote_ptr remote_object;
 	GIT2_CALL(git_remote_lookup(Capture(remote_object), p_repo, CString(p_remote).data), "Could not lookup remote \"" + p_remote + "\"");
@@ -1059,11 +1084,11 @@ void Git::_fetch_impl(git_repository *p_repo, Credentials &p_creds, const String
 	opts.proxy_opts = proxy_opts;
 	GIT2_CALL(git_remote_fetch(remote_object.get(), nullptr, &opts, "fetch"), "Could not fetch data from remote");
 
-	print_line("Git: Fetch ended");
+	git_log("[fetch] 完成");
 }
 
 void Git::_pull_impl(git_repository *p_repo, Credentials &p_creds, const String &p_remote) {
-	print_line("Git: Performing pull from ", p_remote);
+	git_log(vformat("[pull] 开始，远端 \"%s\"", p_remote));
 
 	git_remote_ptr remote_object;
 	GIT2_CALL(git_remote_lookup(Capture(remote_object), p_repo, CString(p_remote).data), "Could not lookup remote \"" + p_remote + "\"");
@@ -1106,7 +1131,7 @@ void Git::_pull_impl(git_repository *p_repo, Credentials &p_creds, const String 
 	}
 
 	if (git_oid_is_zero(&local_merge_oid)) {
-		ERR_PRINT(vformat("Git: Could not find remote branch HEAD for %s. Try pushing the branch first.", branch_name));
+		git_log_error(vformat("远程：找不到 %s 在远端的分支 HEAD，请先把该分支推上去。", branch_name));
 		return;
 	}
 
@@ -1134,7 +1159,7 @@ void Git::_pull_impl(git_repository *p_repo, Credentials &p_creds, const String 
 		git_reference_ptr new_target_ref;
 		GIT2_CALL(git_reference_set_target(Capture(new_target_ref), target_ref.get(), &local_merge_oid, nullptr), "Failed to move HEAD reference");
 
-		print_line("Git: Fast Forwarded");
+		git_log("[pull] 快进合并完成");
 		GIT2_CALL(git_repository_state_cleanup(p_repo), "Could not clean repository state");
 
 	} else if (merge_analysis & GIT_MERGE_ANALYSIS_NORMAL) {
@@ -1150,27 +1175,27 @@ void Git::_pull_impl(git_repository *p_repo, Credentials &p_creds, const String 
 		GIT2_CALL(git_repository_index(Capture(index), p_repo), "Could not get repository index");
 
 		if (git_index_has_conflicts(index.get())) {
-			ERR_PRINT("Git: Index has conflicts. Solve conflicts and make a merge commit.");
+			git_log_error("[pull] 索引存在冲突，请解决冲突后再提交合并结果。");
 		} else {
-			ERR_PRINT("Git: Changes are staged. Make a merge commit.");
+			git_log_error("[pull] 变更已暂存，请提交合并结果以完成合并。");
 		}
 
 		has_merge.store(true);
 
 	} else if (merge_analysis & GIT_MERGE_ANALYSIS_UP_TO_DATE) {
-		print_line("Git: Already up to date");
+		git_log("[pull] 已是最新，无需合并");
 
 		GIT2_CALL(git_repository_state_cleanup(p_repo), "Could not clean repository state");
 
 	} else {
-		ERR_PRINT("Git: Can not merge");
+		git_log_error("[pull] 无法合并（未识别的合并分析结果）");
 	}
 
-	print_line("Git: Pull ended");
+	git_log("[pull] 完成");
 }
 
 void Git::_push_impl(git_repository *p_repo, Credentials &p_creds, const String &p_remote, bool p_force) {
-	print_line("Git: Performing push to ", p_remote);
+	git_log(vformat("[push] 开始，远端 \"%s\"%s", p_remote, p_force ? "，强制" : ""));
 
 	git_remote_ptr remote_object;
 	GIT2_CALL(git_remote_lookup(Capture(remote_object), p_repo, CString(p_remote).data), "Could not lookup remote \"" + p_remote + "\"");
@@ -1201,7 +1226,7 @@ void Git::_push_impl(git_repository *p_repo, Credentials &p_creds, const String 
 
 	GIT2_CALL(git_remote_push(remote_object.get(), &refspec, &push_options), "Failed to push");
 
-	print_line("Git: Push ended");
+	git_log("[push] 完成");
 }
 
 bool Git::_checkout_branch(const String &branch_name) {
@@ -1389,22 +1414,22 @@ bool Git::_initialize(const String &project_path) {
 
 	int init = git_libgit2_init();
 	if (init > 1) {
-		WARN_PRINT("Multiple libgit2 instances are running");
+		git_log_warn(vformat("初始化：进程内有 %d 个 libgit2 实例，请确认没有第二个插件同时在使用它。", init));
 	}
 
 	git_buf discovered_repo_path = {};
 	if (git_repository_discover(&discovered_repo_path, CString(project_path).data, 1, nullptr) == 0) {
 		repo_project_path = String::utf8(discovered_repo_path.ptr);
 
-		print_line("Found a repository at " + repo_project_path + ".");
+		git_log(vformat("初始化：在 %s 找到仓库。", repo_project_path));
 		git_buf_dispose(&discovered_repo_path);
 	} else {
 		repo_project_path = project_path;
 
-		WARN_PRINT("Could not find any higher level repositories.");
+		git_log_warn("初始化：向上未找到已有仓库，将就地新建。");
 	}
 
-	print_line("Selected repository path: " + repo_project_path + ".");
+	git_log(vformat("初始化：使用的仓库路径为 %s。", repo_project_path));
 	GIT2_CALL_R(git_repository_init(Capture(repo), CString(repo_project_path).data, 0), "Could not initialize repository", false);
 
 	git_reference_ptr head;
@@ -1427,9 +1452,9 @@ bool Git::_initialize(const String &project_path) {
 	int error = git_libgit2_opts(GIT_OPT_SET_SSL_CERT_LOCATIONS, cafile.utf8().get_data(), NULL);
 	DirAccess::remove_absolute(cafile); // Always remove the file
 	if (unlikely(error)) {
-		ERR_PRINT("Git: Failed to load CA bundle: " + cafile + ", error: " + itos(error));
+		git_log_error(vformat("TLS：加载 CA 证书包失败（%s，错误码 %d），HTTPS 连接可能无法验证服务器。", cafile, error));
 	} else {
-		print_line("Git: Loaded system CA certificates");
+		git_log("TLS：已加载系统 CA 证书。");
 	}
 
 	// 初始化完成后：主线程同步首扫一次填快照（面板打开即有数据），随后交给

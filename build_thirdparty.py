@@ -26,6 +26,9 @@ build_thirdparty.py —— 构建 godot_git 模块所链接的三个第三方静
     顺序是有依赖的：OpenSSL -> libssh2 -> libgit2。只编单个目标时，
     它前面的产物必须已经存在。
 
+    两个逃生口：--clean 删掉构建目录从头来，--reconfigure 强制重跑
+    OpenSSL 的配置（正常情况下配置没变就不会重跑，见"增量"一节）。
+
 前置条件
     - 三个子模块的源码可用。哪个缺了就自动补哪个：
       git submodule update --init <缺失的路径>（--no-init 可禁用）。
@@ -39,8 +42,11 @@ build_thirdparty.py —— 构建 godot_git 模块所链接的三个第三方静
       vcvarsall 给出的完整集合为准（VCVARSALL 环境变量可指定用它哪一份）
     - 不需要 NASM：OpenSSL 统一以 no-asm 配置（与仓库里已验证的那份产出一致）
 
-重复运行是安全的：cmake 复用既有 cache，nmake/make 做增量编译，改一行
-子模块源码只会重编那一个文件。
+重复运行是安全的，而且实测是增量的：
+    - OpenSSL 只在"配置参数或参与配置的源文件变了"时才重跑 Configure，
+      否则直接交给 nmake 增量编译（不这么做的话每次都会全量重编 1094 个
+      obj，实测 981 秒，见"增量"一节的因果链）；
+    - libssh2 / libgit2 复用 cmake cache，只有真正的源码改动才会重编。
 """
 
 import argparse
@@ -136,6 +142,17 @@ OPENSSL_TARGETS = {
     ("freebsd", "x86_64"): "BSD-x86_64",
     ("freebsd", "arm64"): "BSD-aarch64",
 }
+
+# 传给所有 cmake 项目的通用参数。
+#
+# CMake 4.0 起移除了对 cmake_minimum_required(<3.5) 的兼容，碰到就中止并提示
+# "Compatibility with CMake < 3.5 has been removed"。libssh2 1.11.0 声明的是
+# 3.1（CMakeLists.txt:48），在 cmake 4.x 上必然配置失败；libgit2 声明 3.5.1、
+# 它内嵌的 chromium-zlib 声明 3.11，本来就能过。
+# 统一把策略版本下限抬到 3.5：对声明了更高版本的项目是无操作；cmake < 4 时该
+# 变量未被使用，只会多一条 "Manually-specified variables were not used" 提示，
+# 不构成错误。
+CMAKE_COMMON_ARGS = ["-DCMAKE_POLICY_VERSION_MINIMUM=3.5"]
 
 # OpenSSL 的配置选项。与仓库里那份已验证可用的产出一致：
 # 静态库、无汇编（因此不需要 NASM）、不要测试套件与命令行工具、
@@ -308,10 +325,17 @@ def find_vcvarsall():
 
     vswhere = which("vswhere")
     if not vswhere:
-        # vswhere 的位置与 VS 版本、安装盘符无关，是安装器的固定组件
-        installer = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
-        probe = installer / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
-        vswhere = str(probe) if probe.is_file() else None
+        # vswhere 的位置与 VS 版本、安装盘符无关，是安装器的固定组件。
+        # 用环境变量拼而不是写死 Program Files (x86) 的盘符路径：系统装在别的盘上
+        # 那个字面量就是错的，而且它会让"没有硬编码路径"这条断言失效。
+        for var in ("ProgramFiles(x86)", "ProgramFiles"):
+            root = os.environ.get(var, "").strip()
+            if not root:
+                continue
+            probe = Path(root) / "Microsoft Visual Studio" / "Installer" / "vswhere.exe"
+            if probe.is_file():
+                vswhere = str(probe)
+                break
     if not vswhere:
         return None
 
@@ -355,10 +379,13 @@ def load_msvc_environment(ctx):
     if not vcvarsall:
         return False
 
-    arch = VCVARSALL_ARCH.get(ctx.arch)
+    # VCVARSALL_ARCH 可覆盖映射：--arch 用的是 Godot 的架构名，而测试用的哨兵架构
+    # （或将来某个自定义架构名）不在表里，可能仍需要一个能交给 vcvarsall 的名字。
+    arch = os.environ.get("VCVARSALL_ARCH", "").strip() or VCVARSALL_ARCH.get(ctx.arch)
     if not arch:
         die(
-            'no vcvarsall architecture for arch "%s". Pass --arch with one of: %s.'
+            'no vcvarsall architecture for arch "%s". Pass --arch with one of: %s,\n'
+            "        or set VCVARSALL_ARCH to the name vcvarsall.bat should receive."
             % (ctx.arch, ", ".join(sorted(VCVARSALL_ARCH)))
         )
 
@@ -384,7 +411,7 @@ def load_msvc_environment(ctx):
     applied = 0
     for line in text.splitlines():
         key, sep, value = line.partition("=")
-        # 跳过 "=C:=C:\..." 这类"驱动器当前目录"伪变量：它们的键以 = 开头
+        # 跳过"驱动器当前目录"伪变量：形如 =C:=... 的键以 = 开头
         if not sep or not key or key.startswith("="):
             continue
         os.environ[key.upper()] = value
@@ -443,14 +470,19 @@ def resolve_tools(ctx):
         ["--version"],
         "Install CMake and put it on PATH (https://cmake.org/download/).",
     )
-    ctx.perl, perl_src = resolve_tool(
-        "PERL",
-        ["perl"],
-        ["-v"],
-        "OpenSSL's Configure is a Perl script and cannot run without it.\n        "
-        "Install Perl and put it on PATH (Windows: Strawberry Perl or the\n        "
-        "portable build from the same project).",
-    )
+    # perl 只有 OpenSSL 的 Configure 需要（libssh2 / libgit2 走 cmake，不碰它），
+    # 所以单独编后两个时不该因为机器上没有 perl 就退出。
+    if "openssl" in selected_targets(ctx.args.target):
+        ctx.perl, perl_src = resolve_tool(
+            "PERL",
+            ["perl"],
+            ["-v"],
+            "OpenSSL's Configure is a Perl script and cannot run without it.\n        "
+            "Install Perl and put it on PATH (Windows: Strawberry Perl or the\n        "
+            "portable build from the same project).",
+        )
+    else:
+        perl_src = "not needed (OpenSSL is not in this build)"
 
     # OpenSSL 不走 CMake，需要直接调 make/nmake。这里一律解析成完整路径：
     # 裸名字交给 CreateProcess/execvp 去找时，前者不会按 PATHEXT 补扩展名，
@@ -469,7 +501,7 @@ def resolve_tools(ctx):
             )
 
     log("cmake      : %s (%s)" % (ctx.cmake, cmake_src))
-    log("perl       : %s (%s)" % (ctx.perl, perl_src))
+    log("perl       : %s" % (("%s (%s)" % (ctx.perl, perl_src)) if ctx.perl else perl_src))
     log("make       : %s" % ctx.make)
     log("generator  : %s" % ctx.generator)
     log("platform   : %s / %s" % (ctx.platform, ctx.arch))
@@ -644,16 +676,265 @@ def check_libssh2_resolution(ctx, output, expected):
             "        %s/CMakeCache.txt and try again." % (expected, ", ".join(others), ctx.git2_bld)
         )
 
-    # 拿不到证据就不下结论：不同生成器/版本的输出措辞不一样，
-    # 这里宁可放过也不要误报。
+    # 控制台的措辞因生成器/版本而异，而且**重复配置时那行根本不打印**，
+    # 所以这里不靠猜：改从 CMakeCache.txt 取证（每次配置都会写）。
+    verdict, detail = _libssh2_from_cache(ctx, expected)
+    if verdict == "ok":
+        log("  libssh2 resolved to: %s (OK, from CMakeCache.txt)" % detail)
+        return
+    if verdict == "foreign":
+        die(detail)
+
+    # 连缓存也读不到（例如生成器把缓存放在别处）：仍然只警告，不误报。
     log(
-        "  [WARN] could not tell from the cmake output which libssh2 was used;\n"
-        "         continuing. Expected library was: %s" % expected
+        "  [WARN] could not tell which libssh2 was used (%s);\n"
+        "         continuing. Expected library was: %s" % (detail, expected)
     )
 
 
 def _norm_path(value):
     return str(value).replace("\\", "/").lower()
+
+
+# pkg-config 命中时 pkg_check_modules 会把这些 INTERNAL 标记填上内容，没命中就是
+# 空串。只要有一个非空，libssh2 就是从系统里找到的，而不是我们编的那份。
+_LIBSSH2_PKGCONFIG_MARKERS = (
+    "LIBSSH2_FOUND",
+    "LIBSSH2_MODULE_NAME",
+    "LIBSSH2_LIBS",
+    "LIBSSH2_LIBDIR",
+    "LIBSSH2_LIBS_PATHS",
+)
+
+
+def _cmake_cache_entries(cache_path, prefix):
+    """读 CMakeCache.txt 里以 prefix 开头的项：名字 -> 值。文件读不到返回 None。
+
+    缓存行是 `NAME:TYPE=VALUE`，注释行以 // 开头；只取我们点名要看的那几个名字，
+    所以不需要完整的 CMake 语法解析。
+    """
+    try:
+        text = cache_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    entries = {}
+    for line in text.splitlines():
+        if line.startswith("//") or line.startswith("#"):
+            continue
+        name_type, sep, value = line.partition("=")
+        if not sep:
+            continue
+        name = name_type.partition(":")[0]
+        if name.startswith(prefix):
+            entries[name] = value.strip()
+    return entries
+
+
+def _libssh2_from_cache(ctx, expected):
+    """从 CMakeCache.txt 判断 libgit2 究竟会链哪一份 libssh2。
+
+    返回 ("ok" | "foreign" | "unknown", 说明)。
+
+    为什么要看缓存：cmake 只在**首次**配置时打印 "Found LibSSH2: ..."，重复配置
+    （增量运行后的常态）控制台里根本没有那行，光靠抓输出会退化成"拿不到证据"。
+    缓存是每次配置都写的，而且直接对应 SelectSSH.cmake 的两条分支：
+      - 走 find_package（我们要的）：用的就是缓存里的 LIBSSH2_LIBRARY；
+      - 走 pkg-config（危险的那条）：pkg_check_modules 会留下非空的 INTERNAL 标记。
+    把两类证据合起来看，结论是确定的：pkg-config 没命中 + 缓存里的库就是本地那份，
+    就等于 SelectSSH.cmake:15 那句 set(LIBSSH2_LIBRARIES ${LIBSSH2_LIBRARY})。
+    """
+    entries = _cmake_cache_entries(ctx.git2_bld / "CMakeCache.txt", "LIBSSH2")
+    if entries is None:
+        return "unknown", "CMakeCache.txt is not readable"
+
+    hits = [k for k in _LIBSSH2_PKGCONFIG_MARKERS if entries.get(k)]
+    if hits:
+        return "foreign", (
+            "libgit2 resolved libssh2 through pkg-config.\n"
+            "        expected : %s\n"
+            "        got      : %s\n"
+            "        A system libssh2 (most likely via pkg-config) took precedence.\n"
+            "        Keep it out of reach and re-run: unset PKG_CONFIG_PATH or remove\n"
+            "        its .pc file, then delete %s/CMakeCache.txt and try again."
+            % (
+                expected,
+                ", ".join("%s=%s" % (k, entries[k]) for k in hits),
+                ctx.git2_bld,
+            )
+        )
+
+    actual = entries.get("LIBSSH2_LIBRARY")
+    if not actual:
+        return "unknown", "LIBSSH2_LIBRARY is not recorded in CMakeCache.txt"
+    if _norm_path(actual) != _norm_path(expected):
+        return "foreign", (
+            "libgit2 will link a DIFFERENT libssh2 than the vendored one.\n"
+            "        expected : %s\n"
+            "        got      : %s\n"
+            "        delete %s/CMakeCache.txt and try again."
+            % (expected, actual, ctx.git2_bld)
+        )
+    return "ok", actual
+
+
+# ==============================================================================
+# OpenSSL 的增量：什么时候可以跳过 Configure
+#
+# OpenSSL 是"Configure 生成 Makefile + nmake 增量编译"两段式，问题出在前一段。
+# 只要重跑一次 Configure，configdata.pm 就被改写；而 <bld>/include/openssl 下
+# 那 27 个公开头文件（源树里只有 .h.in 模板）的规则依赖 configdata.pm
+# （Makefile:1615），于是头文件全部重新生成；nmake 的 depend 阶段又把这些头挂到
+# 几乎所有 obj 上，1094 个 obj 因此全判过期。实测：参数一字未变地重跑一次
+# Configure，整个脚本 981 秒，其中约 15 分钟耗在这里。
+#
+# 所以配置没变就跳过 Configure，把增量交给 nmake。两条判据都成立才跳过：
+#   1) configdata.pm 里记着的 perlargv（上次 Configure 收到的完整参数）与本次
+#      要传的完全一致 —— 参数改了必须重配；
+#   2) 没有"参与配置"的源文件比 configdata.pm 更新 —— 源树动了必须重配
+#      （例如子模块换了 tag、手工改了 Configurations/*.conf）。
+# 第 2 条刻意用 mtime 而不是内容哈希：OpenSSL 自己生成的 Makefile 就是这么判的
+# （Makefile:1569 的 `makefile:` 与 :1579 的 `configdata.pm:` 规则，命中就
+# `perl configdata.pm -r` 再 exit 1）。用同一套判据，脚本与 Makefile 不会各说
+# 各话：宁可多配一次，也不会漏配。（代价是 git checkout 回到同样的内容也会重配
+# 一次，这是"保守但正确"的方向。）
+#
+# 逃生口：--reconfigure 无条件重跑配置；--clean 删掉整个构建目录，自然也重配。
+# ==============================================================================
+
+# 上次 Configure 的参数记在 configdata.pm 的 %config{perlargv} 里
+# （configdata.pm:257，形如 "perlargv" => [ "VC-WIN64A", "no-shared", ... ]）。
+_PERLARGV_RE = re.compile(r'"perlargv"\s*=>\s*\[(.*?)\]', re.DOTALL)
+_PERL_STRING_RE = re.compile(r'"((?:[^"\\]|\\.)*)"')
+_PERL_ESCAPES = {"\\": "\\", '"': '"', "$": "$", "n": "\n", "t": "\t", "r": "\r"}
+
+
+def _perl_unquote(value):
+    """还原 Perl 双引号字符串里的转义（路径里的 \\ 会写成 \\\\）。"""
+    out = []
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if char == "\\" and index + 1 < len(value):
+            nxt = value[index + 1]
+            out.append(_PERL_ESCAPES.get(nxt, nxt))
+            index += 2
+        else:
+            out.append(char)
+            index += 1
+    return "".join(out)
+
+
+def recorded_configure_args(configdata):
+    """读回上次 Configure 的参数列表；读不出来返回 None（调用方按"需重配"处理）。"""
+    try:
+        text = configdata.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    match = _PERLARGV_RE.search(text)
+    if not match:
+        return None
+    return [_perl_unquote(s) for s in _PERL_STRING_RE.findall(match.group(1))]
+
+
+def changed_config_sources(configdata):
+    """参与配置、且比 configdata.pm 更新的源文件列表（用于说明为什么要重配）。
+
+    监视集合与 OpenSSL 自己那份 Makefile 的规则对齐：
+      <src>/Configure + 全树 build.info（configdata.pm 的依赖）
+      <src>/Configurations/*（Makefile 模板与目标定义）
+    """
+    try:
+        stamp = configdata.stat().st_mtime
+    except OSError:
+        return ["configdata.pm is missing"]
+    watched = [OPENSSL_SRC / "Configure"]
+    watched += sorted(OPENSSL_SRC.rglob("build.info"))
+    watched += sorted((OPENSSL_SRC / "Configurations").glob("*"))
+    changed = []
+    for path in watched:
+        try:
+            if path.stat().st_mtime > stamp:
+                changed.append(path)
+        except OSError:
+            changed.append(path)
+    return changed
+
+
+def openssl_configure_argv(ctx, target):
+    """本次要交给 Configure 的完整参数（不含 perl 与 Configure 脚本自身）。
+
+    单独抽出来是因为它同时也是"配置有没有变"的比较基准，必须和真正传出去的
+    是同一份，不能两处各写一遍。
+    """
+    options = list(OPENSSL_OPTIONS)
+    if ctx.is_windows:
+        options.append("enable-capieng")
+    return [target] + options + [
+        "--prefix=%s" % ctx.openssl_dest,
+        "--openssldir=%s" % ctx.openssl_dest,
+    ]
+
+
+def openssl_configure_needed(ctx, argv):
+    """返回 (是否需要重跑 Configure, 原因)。"""
+    if ctx.args.reconfigure:
+        return True, "--reconfigure"
+
+    build_dir = ctx.openssl_bld
+    configdata = build_dir / "configdata.pm"
+    if not configdata.is_file() or not (build_dir / "Makefile").is_file():
+        return True, "not configured yet"
+
+    recorded = recorded_configure_args(configdata)
+    if recorded is None:
+        return True, "cannot read the previous options back"
+    if recorded != list(argv):
+        return True, "options changed"
+
+    changed = changed_config_sources(configdata)
+    if changed:
+        return True, "%d config source(s) changed, e.g. %s" % (
+            len(changed),
+            changed[0].name,
+        )
+    return False, ""
+
+
+def openssl_install_stale(ctx):
+    """dest 里装好的库与头文件是否落后于构建产物。返回 (是否落后, 说明)。
+
+    install_sw 是"无条件覆盖"：哪怕什么都没编，跑一次也会刷新 dest 下所有文件的
+    时间戳，而 libssh2 / libgit2 正是拿 dest/include 的头和这份 .lib 去编译的，
+    于是它们会被带着重编重链（实测约 2 分钟）。所以只在确实落后时才装。
+    """
+    for src in (ctx.openssl_ssl, ctx.openssl_crypto):
+        dst = ctx.openssl_dest / "lib" / src.name
+        try:
+            if not dst.is_file() or dst.stat().st_mtime < src.stat().st_mtime:
+                return True, "%s is older than the build output" % src.name
+        except OSError:
+            return True, "%s cannot be inspected" % src.name
+
+    # 公开头文件有两个来源：构建目录里生成的（28 个，源树只有 .h.in 模板），
+    # 以及源树里直接放着的。只认小写 .h —— 源树里那两个 VMS 专用头是
+    # __DECC_INCLUDE_*.H，OpenSSL 的 install 规则显式跳过它们，dest 里永远没有
+    # 对应文件；不排掉它们就会永远判成"落后"，install_sw 每次都会白跑一趟
+    # （顺带把 libssh2/libgit2 拖去重编）。Windows 上 glob("*.h") 大小写不敏感，
+    # 所以这里必须再按后缀过滤一次，不能只靠 glob。
+    dest_headers = ctx.openssl_dest / "include" / "openssl"
+    for src_dir in (ctx.openssl_bld / "include" / "openssl", OPENSSL_SRC / "include" / "openssl"):
+        if not src_dir.is_dir():
+            continue
+        for src in sorted(src_dir.glob("*.h")):
+            if src.suffix != ".h":
+                continue
+            dst = dest_headers / src.name
+            try:
+                if not dst.is_file() or dst.stat().st_mtime < src.stat().st_mtime:
+                    return True, "header %s is older than the build output" % src.name
+            except OSError:
+                return True, "header %s cannot be inspected" % src.name
+    return False, ""
 
 
 # ==============================================================================
@@ -683,32 +964,44 @@ def build_openssl(ctx):
     ctx.openssl_bld.mkdir(parents=True, exist_ok=True)
 
     # OpenSSL 不是 CMake 工程：Configure 在构建目录里跑，指向源码树。
-    options = list(OPENSSL_OPTIONS)
-    if ctx.is_windows:
-        options.append("enable-capieng")
-    cmd = [
-        ctx.perl,
-        str(OPENSSL_SRC / "Configure"),
-        target,
-    ] + options + [
-        "--prefix=%s" % ctx.openssl_dest,
-        "--openssldir=%s" % ctx.openssl_dest,
-    ]
-    rc, _ = run(ctx, cmd, cwd=ctx.openssl_bld)
-    if rc != 0:
-        die("OpenSSL: Configure failed.")
+    argv = openssl_configure_argv(ctx, target)
+
+    # 配置没变就不重跑：这一句是整套增量的关键，重跑一次会让 1094 个 obj
+    # 全部过期（因果链见上面"OpenSSL 的增量"一节）。
+    reconfigure, reason = openssl_configure_needed(ctx, argv)
+    if reconfigure:
+        log("  configure  : running (%s)" % reason)
+        rc, _ = run(
+            ctx,
+            [ctx.perl, str(OPENSSL_SRC / "Configure")] + argv,
+            cwd=ctx.openssl_bld,
+        )
+        if rc != 0:
+            die("OpenSSL: Configure failed.")
+    else:
+        log("  configure  : up to date, skipped (--reconfigure forces it)")
 
     # 串行构建。这里的 make 不加 -j：OpenSSL 自己生成的 Makefile 是一套
     # 生成式规则，串行是唯一不需要额外验证的用法，而这几分钟的差别无关紧要。
     rc, _ = run(ctx, [ctx.make], cwd=ctx.openssl_bld)
     if rc != 0:
-        die("OpenSSL: build failed.")
+        die(
+            "OpenSSL: build failed.\n"
+            '        If the output says "Detected changed" or asks you to run the same\n'
+            "        make command again, the sources no longer match the recorded\n"
+            "        configuration: re-run with --reconfigure."
+        )
 
     # install_sw = 只装库与头文件。dest/include 是 libssh2 / libgit2 要找的
     # 头文件位置；它们链接的 .lib/.a 是构建目录根部那份，不是 dest/lib 下的拷贝。
-    rc, _ = run(ctx, [ctx.make, "install_sw"], cwd=ctx.openssl_bld)
-    if rc != 0:
-        die("OpenSSL: install_sw failed.")
+    stale, why = openssl_install_stale(ctx)
+    if reconfigure or stale:
+        log("  install    : running (%s)" % (why or "the configuration just changed"))
+        rc, _ = run(ctx, [ctx.make, "install_sw"], cwd=ctx.openssl_bld)
+        if rc != 0:
+            die("OpenSSL: install_sw failed.")
+    else:
+        log("  install    : dest is already in sync, skipped")
 
     require_file(ctx, ctx.openssl_ssl, "OpenSSL: libssl%s" % ctx.lib_ext)
     require_file(ctx, ctx.openssl_crypto, "OpenSSL: libcrypto%s" % ctx.lib_ext)
@@ -731,6 +1024,7 @@ def build_libssh2(ctx):
     cmd = [
         ctx.cmake,
         "-G", ctx.generator,
+        *CMAKE_COMMON_ARGS,
         "-DCMAKE_BUILD_TYPE=Release",
         "-DBUILD_SHARED_LIBS=OFF",
         "-DBUILD_STATIC_LIBS=ON",
@@ -783,6 +1077,7 @@ def build_libgit2(ctx):
     cmd = [
         ctx.cmake,
         "-G", ctx.generator,
+        *CMAKE_COMMON_ARGS,
         "-DCMAKE_BUILD_TYPE=Release",
         "-DBUILD_SHARED_LIBS=OFF",
         "-DBUILD_TESTS=OFF",
@@ -856,11 +1151,15 @@ def parse_args(argv):
             "  CMAKE_GENERATOR   CMake 生成器；默认 Windows 用 NMake Makefiles，\n"
             "                    类 Unix 优先 Ninja，否则 Unix Makefiles\n"
             "  VCVARSALL         vcvarsall.bat 的完整路径；Windows 默认用 vswhere 找\n"
+            "  VCVARSALL_ARCH    交给 vcvarsall.bat 的架构名；默认由 --arch 映射得到\n"
+            "                    （x86_64->x64 等），自定义架构名时才需要设置\n"
             "\n"
             "示例：\n"
             "  python build_thirdparty.py\n"
             "  python build_thirdparty.py libgit2\n"
-            "  python build_thirdparty.py --clean all\n"
+            "  python build_thirdparty.py              # 重复运行只做增量，秒级\n"
+            "  python build_thirdparty.py --clean all          # 清掉重来\n"
+            "  python build_thirdparty.py --reconfigure all    # 强制重跑 OpenSSL 配置\n"
             "  python build_thirdparty.py --depth 1 all    # 首次拉源码走浅克隆\n"
             "  CMAKE=/path/to/cmake/bin/cmake python build_thirdparty.py\n"
         ),
@@ -897,6 +1196,14 @@ def parse_args(argv):
         ),
     )
     parser.add_argument("--clean", action="store_true", help="构建前删除本平台的构建目录")
+    parser.add_argument(
+        "--reconfigure",
+        action="store_true",
+        help=(
+            "强制重跑 OpenSSL 的 Configure（正常情况下配置没变就跳过，见脚本头部说明）。"
+            "只影响 OpenSSL：libssh2 / libgit2 的 cmake configure 每次都会重跑"
+        ),
+    )
     return parser.parse_args(argv)
 
 
